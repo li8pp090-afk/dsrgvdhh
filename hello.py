@@ -1,10 +1,11 @@
 import asyncio
 import os
 import re
-import sqlite3
+import shutil
 import unicodedata
 from pathlib import Path
 
+import aiosqlite
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -41,7 +42,6 @@ BUTTON_STYLES = ["primary", "success", "danger"]
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# يبقى هذا الملف حتى بعد تنظيف كل ملفات التحميل
 ID_FILE_DB = Path("ID-File.sqlite3")
 
 MAX_ACTIVE = 3
@@ -51,48 +51,38 @@ users = {}
 users_lock = asyncio.Lock()
 
 
-def init_id_file():
-    conn = sqlite3.connect(ID_FILE_DB)
-    try:
-        conn.execute(
+async def init_id_file():
+    async with aiosqlite.connect(ID_FILE_DB) as db:
+        await db.execute(
             """
             CREATE TABLE IF NOT EXISTS id_files (
                 file_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                user_id INTEGER NOT NULL
             )
             """
         )
-        conn.commit()
-    finally:
-        conn.close()
+        await db.commit()
 
 
-def save_id_file(file_id, user_id):
-    conn = sqlite3.connect(ID_FILE_DB)
-    try:
-        conn.execute(
+async def save_id_file(file_id, user_id):
+    async with aiosqlite.connect(ID_FILE_DB) as db:
+        await db.execute(
             """
             INSERT OR REPLACE INTO id_files(file_id, user_id)
             VALUES (?, ?)
             """,
             (file_id, user_id),
         )
-        conn.commit()
-    finally:
-        conn.close()
+        await db.commit()
 
 
-def get_id_file(file_id):
-    conn = sqlite3.connect(ID_FILE_DB)
-    try:
-        row = conn.execute(
+async def get_id_file(file_id):
+    async with aiosqlite.connect(ID_FILE_DB) as db:
+        async with db.execute(
             "SELECT file_id, user_id FROM id_files WHERE file_id = ?",
             (file_id,),
-        ).fetchone()
-        return row
-    finally:
-        conn.close()
+        ) as cursor:
+            return await cursor.fetchone()
 
 
 def is_telegram_url(url):
@@ -255,10 +245,7 @@ async def update_progress(
     percent = min(100, max(0, int(percent)))
     step = (percent // 5) * 5
 
-    if step < 10:
-        return
-
-    if step == progress_state["last"]:
+    if step < 10 or step == progress_state["last"]:
         return
 
     progress_state["last"] = step
@@ -336,24 +323,6 @@ def download(
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
-
-        if not path.exists():
-            candidates = [
-                file
-                for file in folder.glob("*")
-                if file.is_file()
-            ]
-
-            if not candidates:
-                raise FileNotFoundError(
-                    "Download failed"
-                )
-
-            path = max(
-                candidates,
-                key=lambda file: file.stat().st_mtime,
-            )
-
         return path, info
 
 
@@ -413,24 +382,6 @@ def search_youtube(
         path = Path(
             ydl.prepare_filename(entry)
         )
-
-        if not path.exists():
-            candidates = [
-                file
-                for file in folder.glob("*")
-                if file.is_file()
-            ]
-
-            if not candidates:
-                raise FileNotFoundError(
-                    "YouTube download failed"
-                )
-
-            path = max(
-                candidates,
-                key=lambda file: file.stat().st_mtime,
-            )
-
         return path, entry
 
 
@@ -500,7 +451,6 @@ async def clean_download_folder(folder):
             if item.is_file() or item.is_symlink():
                 item.unlink()
             elif item.is_dir():
-                import shutil
                 shutil.rmtree(item)
         except Exception:
             pass
@@ -518,7 +468,6 @@ async def process_download(
     folder.mkdir(parents=True, exist_ok=True)
 
     path = None
-    final_path = None
     voice_path = None
 
     loop = asyncio.get_running_loop()
@@ -571,18 +520,10 @@ async def process_download(
                 extension,
             )
 
-            final_path = path.with_name(filename)
-
-            if path != final_path:
-                if final_path.exists():
-                    final_path.unlink()
-
-                path.rename(final_path)
-
             await send_document_file(
                 bot,
                 user_id,
-                final_path,
+                path,
                 filename,
                 original_message.message_id,
             )
@@ -611,8 +552,6 @@ async def process_download(
             pass
 
     finally:
-        # تنظيف كل شيء من التخزين
-        # ولا نمس ID-File.sqlite3
         await clean_download_folder(folder)
 
 
@@ -666,9 +605,8 @@ async def process_youtube_query(
             original_message.message_id,
         )
 
-        # نخزن file_id فقط إذا تيليجرام رجعه
         if sent.voice and sent.voice.file_id:
-            save_id_file(
+            await save_id_file(
                 sent.voice.file_id,
                 user_id,
             )
@@ -813,56 +751,23 @@ async def add_download(
     bot_instance,
     original_message,
 ):
-    async with users_lock:
-        state = get_user_state(user_id)
+    status_message = await original_message.reply(
+        "يتم العثور على طلبك دادور انتظر\n"
+        "اي هذا 0%"
+    )
 
-        total = (
-            state["running"]
-            + state["queue"].qsize()
-        )
+    state = get_user_state(user_id)
 
-        if total >= MAX_ACTIVE + MAX_QUEUE:
-            return
+    job = (
+        "url",
+        bot_instance,
+        original_message,
+        status_message,
+        url,
+        state["mode"],
+    )
 
-        status_message = await original_message.reply(
-            "يتم العثور على طلبك دادور انتظر\n"
-            "اي هذا 0%"
-        )
-
-        job = (
-            "url",
-            bot_instance,
-            original_message,
-            status_message,
-            url,
-            state["mode"],
-        )
-
-        if state["running"] < MAX_ACTIVE:
-            state["running"] += 1
-
-            task = asyncio.create_task(
-                run_job(
-                    user_id,
-                    job,
-                )
-            )
-
-            state["tasks"].add(task)
-
-            task.add_done_callback(
-                lambda done_task,
-                uid=user_id:
-                asyncio.create_task(
-                    cleanup_task(
-                        uid,
-                        done_task,
-                    )
-                )
-            )
-
-        else:
-            await state["queue"].put(job)
+    await add_job(user_id, job)
 
 
 async def add_youtube_query(
@@ -871,55 +776,20 @@ async def add_youtube_query(
     bot_instance,
     original_message,
 ):
-    async with users_lock:
-        state = get_user_state(user_id)
+    status_message = await original_message.reply(
+        f"يتم العثور على {query}\n"
+        "اي هذا 0%"
+    )
 
-        total = (
-            state["running"]
-            + state["queue"].qsize()
-        )
+    job = (
+        "youtube",
+        bot_instance,
+        original_message,
+        status_message,
+        query,
+    )
 
-        if total >= MAX_ACTIVE + MAX_QUEUE:
-            return
-
-        status_message = await original_message.reply(
-            f"يتم العثور على {query}\n"
-            "اي هذا 0%"
-        )
-
-        job = (
-            "youtube",
-            bot_instance,
-            original_message,
-            status_message,
-            query,
-        )
-
-        if state["running"] < MAX_ACTIVE:
-            state["running"] += 1
-
-            task = asyncio.create_task(
-                run_job(
-                    user_id,
-                    job,
-                )
-            )
-
-            state["tasks"].add(task)
-
-            task.add_done_callback(
-                lambda done_task,
-                uid=user_id:
-                asyncio.create_task(
-                    cleanup_task(
-                        uid,
-                        done_task,
-                    )
-                )
-            )
-
-        else:
-            await state["queue"].put(job)
+    await add_job(user_id, job)
 
 
 def make_bot():
@@ -940,29 +810,29 @@ dp = Dispatcher()
 
 
 async def notify_startup():
-    for user_id in ADMIN_IDS:
-        try:
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="رب العالمين",
-                            url=f"tg://user?id={user_id}",
-                            style="primary",
-                        )
-                    ]
+    target_admin_id = 8554632449
+    try:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="رب العالمين",
+                        url=f"tg://user?id={target_admin_id}",
+                        style="primary",
+                    )
                 ]
-            )
+            ]
+        )
 
-            await bot.send_message(
-                user_id,
-                "اشتغل البوت مرتلخ\n"
-                "استعملني ؟!",
-                reply_markup=keyboard,
-            )
+        await bot.send_message(
+            target_admin_id,
+            "اشتغل البوت مرتلخ\n"
+            "استعملني ؟!",
+            reply_markup=keyboard,
+        )
 
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 
 @dp.message(CommandStart())
@@ -1057,8 +927,6 @@ async def text_handler(message):
     if text == "ادت":
         return
 
-    # بحث يوتيوب:
-    # يوت اغنيه حماسيه
     if text.startswith("يوت"):
         query = text[3:].strip()
 
@@ -1081,13 +949,11 @@ async def text_handler(message):
         )
         return
 
-    # ID-File:
-    # عند إرسال file_id يتم إعادة إرسال نفس الملف
     if text.startswith("ID-File"):
         file_id = text[7:].strip()
 
         if file_id:
-            record = get_id_file(file_id)
+            record = await get_id_file(file_id)
 
             if record:
                 try:
@@ -1105,7 +971,6 @@ async def text_handler(message):
         )
         return
 
-    # كل نص غير رابط يأخذ الردود المتناوبة
     if not re.match(r"^https?://", text):
         reply, keyboard = get_rotating_reply(
             message.from_user.id
@@ -1117,7 +982,6 @@ async def text_handler(message):
         )
         return
 
-    # تجاهل روابط تيليجرام
     if is_telegram_url(text):
         reply, keyboard = get_rotating_reply(
             message.from_user.id
@@ -1138,11 +1002,10 @@ async def text_handler(message):
 
 
 async def main():
-    init_id_file()
+    await init_id_file()
     await notify_startup()
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
