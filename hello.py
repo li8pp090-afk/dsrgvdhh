@@ -140,9 +140,6 @@ def make_filename(
 
 def get_user_state(user_id):
     if user_id not in users:
-        reply_ids = ADMIN_IDS.copy()
-        styles = BUTTON_STYLES.copy()
-
         users[user_id] = {
             "mode": "normal",
             "queue": asyncio.Queue(
@@ -151,11 +148,30 @@ def get_user_state(user_id):
             "running": 0,
             "tasks": set(),
             "reply_index": 0,
-            "reply_ids": reply_ids,
-            "reply_styles": styles,
+            "reply_ids": ADMIN_IDS.copy(),
+            "reply_styles": BUTTON_STYLES.copy(),
         }
 
     return users[user_id]
+
+
+def next_mawlai_button(user_id):
+    state = get_user_state(user_id)
+
+    if not state["reply_ids"]:
+        state["reply_ids"] = ADMIN_IDS.copy()
+
+    if not state["reply_styles"]:
+        state["reply_styles"] = BUTTON_STYLES.copy()
+
+    reply_id = state["reply_ids"].pop(0)
+    style = state["reply_styles"].pop(0)
+
+    return InlineKeyboardButton(
+        text="مولاي",
+        url=f"tg://user?id={reply_id}",
+        style=style,
+    )
 
 
 def get_rotating_reply(user_id):
@@ -169,29 +185,10 @@ def get_rotating_reply(user_id):
         state["reply_index"] + 1
     ) % len(ROTATING_REPLIES)
 
-    if not state["reply_ids"]:
-        state["reply_ids"] = ADMIN_IDS.copy()
-
-    reply_id = state["reply_ids"].pop(0)
-
-    if not state["reply_styles"]:
-        state["reply_styles"] = BUTTON_STYLES.copy()
-
-    button_style = state[
-        "reply_styles"
-    ].pop(0)
-
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="مولاي",
-                    url=(
-                        f"tg://user?id="
-                        f"{reply_id}"
-                    ),
-                    style=button_style,
-                )
+                next_mawlai_button(user_id)
             ]
         ]
     )
@@ -214,15 +211,7 @@ def mode_keyboard(user_id):
                         else "danger"
                     ),
                 ),
-                InlineKeyboardButton(
-                    text="ستيكر",
-                    callback_data="mode_sticker",
-                    style=(
-                        "success"
-                        if mode == "sticker"
-                        else "danger"
-                    ),
-                ),
+                next_mawlai_button(user_id),
             ],
             [
                 InlineKeyboardButton(
@@ -296,7 +285,9 @@ def download(
         if data.get("status") != "downloading":
             return
 
-        total = data.get("total_bytes")
+        total = data.get(
+            "total_bytes"
+        )
 
         if not total:
             total = data.get(
@@ -327,10 +318,6 @@ def download(
 
     if mode == "audio":
         fmt = "bestaudio/best"
-
-    elif mode == "sticker":
-        fmt = "bestvideo/best"
-
     else:
         fmt = "bestvideo+bestaudio/best"
 
@@ -414,22 +401,6 @@ async def send_voice_file(
     )
 
 
-async def send_animation_file(
-    bot,
-    user_id,
-    path,
-    reply_to,
-):
-    await bot.send_animation(
-        chat_id=user_id,
-        animation=FSInputFile(
-            path,
-            filename=path.name,
-        ),
-        reply_to_message_id=reply_to,
-    )
-
-
 async def process(
     user_id,
     url,
@@ -486,36 +457,6 @@ async def process(
                 bot,
                 user_id,
                 voice_path,
-                original_message.message_id,
-            )
-
-        elif mode == "sticker":
-            extension = (
-                path.suffix
-                .lstrip(".")
-                .lower()
-            )
-
-            filename = make_filename(
-                publisher,
-                title,
-                extension,
-            )
-
-            final_path = path.with_name(
-                filename
-            )
-
-            if path != final_path:
-                if final_path.exists():
-                    final_path.unlink()
-
-                path.rename(final_path)
-
-            await send_animation_file(
-                bot,
-                user_id,
-                final_path,
                 original_message.message_id,
             )
 
@@ -628,16 +569,34 @@ async def run_download(
 
                 state["running"] += 1
 
-                task = asyncio.create_task(
-                    run_download(
-                        user_id,
-                        next_url,
-                        bot,
-                        next_mode,
-                        next_message,
-                        next_status,
+                if next_url.startswith(
+                    "__YOUTUBE__"
+                ):
+                    next_query = next_url[
+                        len("__YOUTUBE__"):
+                    ]
+
+                    task = asyncio.create_task(
+                        run_youtube_download(
+                            user_id,
+                            next_query,
+                            bot,
+                            next_message,
+                            next_status,
+                        )
                     )
-                )
+
+                else:
+                    task = asyncio.create_task(
+                        run_download(
+                            user_id,
+                            next_url,
+                            bot,
+                            next_mode,
+                            next_message,
+                            next_status,
+                        )
+                    )
 
                 state["tasks"].add(task)
 
@@ -773,7 +732,7 @@ async def download_settings(message):
 
     await message.reply(
         "تستطيع تغيير وضع عمل البوت من صوت الى\n"
-        "ستيكر الى الوضع الافتراضي من هذه الأزرار",
+        "الوضع الافتراضي من هذه الأزرار",
         reply_markup=mode_keyboard(
             user_id
         ),
@@ -790,30 +749,11 @@ async def select_audio(
 
     async with users_lock:
         state = get_user_state(user_id)
-        state["mode"] = "audio"
 
-        keyboard = mode_keyboard(
-            user_id
-        )
-
-    await callback.message.edit_reply_markup(
-        reply_markup=keyboard
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data == "mode_sticker"
-)
-async def select_sticker(
-    callback: CallbackQuery,
-):
-    user_id = callback.from_user.id
-
-    async with users_lock:
-        state = get_user_state(user_id)
-        state["mode"] = "sticker"
+        if state["mode"] == "audio":
+            state["mode"] = "normal"
+        else:
+            state["mode"] = "audio"
 
         keyboard = mode_keyboard(
             user_id
@@ -858,16 +798,323 @@ async def select_normal(
     await callback.answer()
 
 
+def search_youtube(query):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        data = ydl.extract_info(
+            f"ytsearch10:{query}",
+            download=False,
+        )
+
+    entries = [
+        entry
+        for entry in (
+            data.get("entries")
+            or []
+        )
+        if entry
+    ]
+
+    if not entries:
+        raise FileNotFoundError(
+            "No YouTube result"
+        )
+
+    max_views = max(
+        [
+            int(
+                entry.get(
+                    "view_count"
+                )
+                or 0
+            )
+            for entry in entries
+        ]
+        + [1]
+    )
+
+    def score(item):
+        views = int(
+            item.get(
+                "view_count"
+            )
+            or 0
+        )
+
+        rank = entries.index(item)
+
+        rank_score = (
+            len(entries) - rank
+        ) / len(entries)
+
+        view_score = (
+            views / max_views
+        )
+
+        return (
+            view_score * 0.7
+            + rank_score * 0.3
+        )
+
+    best = max(
+        entries,
+        key=score,
+    )
+
+    video_id = best.get("id")
+
+    return (
+        best.get("webpage_url")
+        or best.get("url")
+        or (
+            f"https://www.youtube.com/watch?v="
+            f"{video_id}"
+            if video_id
+            else None
+        )
+    )
+
+
+async def youtube_search_and_download(
+    user_id,
+    query,
+    bot,
+    original_message,
+):
+    async with users_lock:
+        state = get_user_state(user_id)
+
+        total = (
+            state["running"]
+            + state["queue"].qsize()
+        )
+
+        if total >= (
+            MAX_ACTIVE + MAX_QUEUE
+        ):
+            return
+
+        status_message = await (
+            original_message.reply(
+                f"يتم العثور على {query}\n"
+                "اي هذا 0%"
+            )
+        )
+
+        if state["running"] < MAX_ACTIVE:
+            state["running"] += 1
+
+            task = asyncio.create_task(
+                run_youtube_download(
+                    user_id,
+                    query,
+                    bot,
+                    original_message,
+                    status_message,
+                )
+            )
+
+            state["tasks"].add(task)
+
+            task.add_done_callback(
+                lambda task,
+                uid=user_id:
+                asyncio.create_task(
+                    cleanup_task(
+                        uid,
+                        task,
+                    )
+                )
+            )
+
+        else:
+            await state["queue"].put(
+                (
+                    f"__YOUTUBE__{query}",
+                    "audio",
+                    original_message,
+                    status_message,
+                )
+            )
+
+
+async def run_youtube_download(
+    user_id,
+    query,
+    bot,
+    original_message,
+    status_message,
+):
+    folder = DOWNLOAD_DIR / str(
+        user_id
+    )
+
+    folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path = None
+    voice_path = None
+
+    loop = asyncio.get_running_loop()
+
+    try:
+        url = await asyncio.to_thread(
+            search_youtube,
+            query,
+        )
+
+        if not url:
+            raise FileNotFoundError(
+                "No YouTube result"
+            )
+
+        path, info = await asyncio.to_thread(
+            download,
+            url,
+            folder,
+            "audio",
+            status_message,
+            loop,
+        )
+
+        publisher = (
+            info.get("uploader")
+            or info.get("channel")
+            or "unknown"
+        )
+
+        voice_path = folder / (
+            f"{clean_publisher(publisher)}.ogg"
+        )
+
+        await convert_to_voice(
+            path,
+            voice_path,
+        )
+
+        await send_voice_file(
+            bot,
+            user_id,
+            voice_path,
+            original_message.message_id,
+        )
+
+        await status_message.edit_text(
+            f"تم العثور على {query}\n"
+            "وتم تنفيذ طلبك بدون أدنى مشكلة"
+        )
+
+    except Exception:
+        try:
+            await status_message.edit_text(
+                "الرابط غير مدعوم او الموقع مو مدعوم\n"
+                "شم كسي يلا"
+            )
+        except Exception:
+            pass
+
+    finally:
+        for file in (
+            voice_path,
+            path,
+        ):
+            if file and file.exists():
+                try:
+                    file.unlink()
+                except Exception:
+                    pass
+
+        async with users_lock:
+            state = users.get(user_id)
+
+            if not state:
+                return
+
+            state["running"] -= 1
+
+            if not state["queue"].empty():
+                (
+                    next_url,
+                    next_mode,
+                    next_message,
+                    next_status,
+                ) = await state["queue"].get()
+
+                state["running"] += 1
+
+                if next_url.startswith(
+                    "__YOUTUBE__"
+                ):
+                    next_query = next_url[
+                        len("__YOUTUBE__"):
+                    ]
+
+                    task = asyncio.create_task(
+                        run_youtube_download(
+                            user_id,
+                            next_query,
+                            bot,
+                            next_message,
+                            next_status,
+                        )
+                    )
+
+                else:
+                    task = asyncio.create_task(
+                        run_download(
+                            user_id,
+                            next_url,
+                            bot,
+                            next_mode,
+                            next_message,
+                            next_status,
+                        )
+                    )
+
+                state["tasks"].add(task)
+
+                task.add_done_callback(
+                    lambda task,
+                    uid=user_id:
+                    asyncio.create_task(
+                        cleanup_task(
+                            uid,
+                            task,
+                        )
+                    )
+                )
+
+
 @dp.message(F.text)
 async def link_handler(message):
-    url = message.text.strip()
+    text_value = message.text.strip()
 
-    if message.text == "ادت":
+    if text_value == "ادت":
         return
+
+    if text_value.startswith("يوت"):
+        query = text_value[3:].strip()
+
+        if query:
+            await youtube_search_and_download(
+                message.from_user.id,
+                query,
+                bot,
+                message,
+            )
+            return
 
     if not re.match(
         r"^https?://",
-        url,
+        text_value,
     ):
         reply, keyboard = get_rotating_reply(
             message.from_user.id
@@ -880,12 +1127,12 @@ async def link_handler(message):
 
         return
 
-    if is_telegram_url(url):
+    if is_telegram_url(text_value):
         return
 
     await add_download(
         message.from_user.id,
-        url,
+        text_value,
         bot,
         message,
     )
