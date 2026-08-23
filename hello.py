@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import sqlite3
 import unicodedata
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from aiogram.types import (
 )
 
 TOKEN = os.environ["BOT_TOKEN"]
-
 LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "").strip()
 
 ADMIN_IDS = [
@@ -31,22 +31,18 @@ ADMIN_IDS = [
 ]
 
 ROTATING_REPLIES = [
-    "مو ناوي تستعملني مثل البوتات ترى اذا اضوج\n"
-    "اصيح المولاي يغصص بلاعيمك",
-    "اهو فطستني بسوالفك هاي ديلا دز رابط اريد\n"
-    "انفذلك طلباتك علمود انام",
-    "ترى يمكن انطيك بلوك واعوفك ملبوس\n"
-    "ها شتكول بيبي",
+    "مو ناوي تستعملني مثل البوتات ترى اذا اضوج\nاصيح المولاي يغصص بلاعيمك",
+    "اهو فطستني بسوالفك هاي ديلا دز رابط اريد\nانفذلك طلباتك علمود انام",
+    "ترى يمكن انطيك بلوك واعوفك ملبوس\nها شتكول بيبي",
 ]
 
-BUTTON_STYLES = [
-    "primary",
-    "success",
-    "danger",
-]
+BUTTON_STYLES = ["primary", "success", "danger"]
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# يبقى هذا الملف حتى بعد تنظيف كل ملفات التحميل
+ID_FILE_DB = Path("ID-File.sqlite3")
 
 MAX_ACTIVE = 3
 MAX_QUEUE = 3
@@ -54,8 +50,49 @@ MAX_QUEUE = 3
 users = {}
 users_lock = asyncio.Lock()
 
-EN_UPPER = set("ATGUFNJML")
-RU_UPPER = set("АИБ")
+
+def init_id_file():
+    conn = sqlite3.connect(ID_FILE_DB)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS id_files (
+                file_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_id_file(file_id, user_id):
+    conn = sqlite3.connect(ID_FILE_DB)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO id_files(file_id, user_id)
+            VALUES (?, ?)
+            """,
+            (file_id, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_id_file(file_id):
+    conn = sqlite3.connect(ID_FILE_DB)
+    try:
+        row = conn.execute(
+            "SELECT file_id, user_id FROM id_files WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
 
 
 def is_telegram_url(url):
@@ -73,6 +110,10 @@ def is_telegram_url(url):
         or domain == "telegram.dog"
         or domain.endswith(".telegram.dog")
     )
+
+
+EN_UPPER = set("ATGUFNJML")
+RU_UPPER = set("АИБ")
 
 
 def clean_publisher(name):
@@ -106,7 +147,11 @@ def clean_title(name):
 def make_filename(publisher, title, extension):
     publisher = clean_publisher(publisher)
     title = clean_title(title)
-    extension = re.sub(r"[^A-Za-z0-9]+", "", extension.lower())
+    extension = re.sub(
+        r"[^A-Za-z0-9]+",
+        "",
+        extension.lower(),
+    )
 
     if not extension:
         extension = "bin"
@@ -133,6 +178,7 @@ def get_rotating_reply(user_id):
     state = get_user_state(user_id)
 
     reply = ROTATING_REPLIES[state["reply_index"]]
+
     state["reply_index"] = (
         state["reply_index"] + 1
     ) % len(ROTATING_REPLIES)
@@ -212,9 +258,6 @@ async def update_progress(
     if step < 10:
         return
 
-    if step > 100:
-        step = 100
-
     if step == progress_state["last"]:
         return
 
@@ -232,11 +275,7 @@ async def update_progress(
     asyncio.run_coroutine_threadsafe(edit(), loop)
 
 
-def build_yt_options(
-    fmt,
-    folder,
-    progress_hook,
-):
+def build_yt_options(fmt, folder, progress_hook):
     return {
         "format": fmt,
         "outtmpl": str(folder / "%(title)s.%(ext)s"),
@@ -270,7 +309,7 @@ def download(
         if not total:
             return
 
-        percent = (downloaded / total) * 100
+        percent = downloaded / total * 100
 
         asyncio.run_coroutine_threadsafe(
             update_progress(
@@ -282,10 +321,11 @@ def download(
             loop,
         )
 
-    if mode == "audio":
-        fmt = "bestaudio/best"
-    else:
-        fmt = "bestvideo+bestaudio/best"
+    fmt = (
+        "bestaudio/best"
+        if mode == "audio"
+        else "bestvideo+bestaudio/best"
+    )
 
     options = build_yt_options(
         fmt,
@@ -305,7 +345,9 @@ def download(
             ]
 
             if not candidates:
-                raise FileNotFoundError("Download failed")
+                raise FileNotFoundError(
+                    "Download failed"
+                )
 
             path = max(
                 candidates,
@@ -315,7 +357,12 @@ def download(
         return path, info
 
 
-def search_youtube(query, folder, status_message, loop):
+def search_youtube(
+    query,
+    folder,
+    status_message,
+    loop,
+):
     progress_state = {"last": 0}
 
     def progress_hook(data):
@@ -331,7 +378,7 @@ def search_youtube(query, folder, status_message, loop):
         if not total:
             return
 
-        percent = (downloaded / total) * 100
+        percent = downloaded / total * 100
 
         asyncio.run_coroutine_threadsafe(
             update_progress(
@@ -343,8 +390,6 @@ def search_youtube(query, folder, status_message, loop):
             loop,
         )
 
-    search_url = f"ytsearch1:{query}"
-
     options = build_yt_options(
         "bestaudio/best",
         folder,
@@ -353,16 +398,21 @@ def search_youtube(query, folder, status_message, loop):
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(
-            search_url,
+            f"ytsearch1:{query}",
             download=True,
         )
 
         entries = info.get("entries") or []
+
         if not entries:
-            raise LookupError("No YouTube result")
+            raise LookupError(
+                "No YouTube result"
+            )
 
         entry = entries[0]
-        path = Path(ydl.prepare_filename(entry))
+        path = Path(
+            ydl.prepare_filename(entry)
+        )
 
         if not path.exists():
             candidates = [
@@ -372,7 +422,9 @@ def search_youtube(query, folder, status_message, loop):
             ]
 
             if not candidates:
-                raise FileNotFoundError("YouTube download failed")
+                raise FileNotFoundError(
+                    "YouTube download failed"
+                )
 
             path = max(
                 candidates,
@@ -382,7 +434,10 @@ def search_youtube(query, folder, status_message, loop):
         return path, entry
 
 
-async def convert_to_voice(input_path, output_path):
+async def convert_to_voice(
+    input_path,
+    output_path,
+):
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
@@ -396,10 +451,12 @@ async def convert_to_voice(input_path, output_path):
         stderr=asyncio.subprocess.DEVNULL,
     )
 
-    return_code = await process.wait()
+    code = await process.wait()
 
-    if return_code != 0 or not output_path.exists():
-        raise RuntimeError("FFmpeg voice conversion failed")
+    if code != 0 or not output_path.exists():
+        raise RuntimeError(
+            "FFmpeg voice conversion failed"
+        )
 
 
 async def send_voice_file(
@@ -408,11 +465,13 @@ async def send_voice_file(
     path,
     reply_to,
 ):
-    await bot.send_voice(
+    message = await bot.send_voice(
         chat_id=user_id,
         voice=FSInputFile(path),
         reply_to_message_id=reply_to,
     )
+
+    return message
 
 
 async def send_document_file(
@@ -422,7 +481,7 @@ async def send_document_file(
     filename,
     reply_to,
 ):
-    await bot.send_document(
+    return await bot.send_document(
         chat_id=user_id,
         document=FSInputFile(
             path,
@@ -430,6 +489,21 @@ async def send_document_file(
         ),
         reply_to_message_id=reply_to,
     )
+
+
+async def clean_download_folder(folder):
+    if not folder.exists():
+        return
+
+    for item in folder.iterdir():
+        try:
+            if item.is_file() or item.is_symlink():
+                item.unlink()
+            elif item.is_dir():
+                import shutil
+                shutil.rmtree(item)
+        except Exception:
+            pass
 
 
 async def process_download(
@@ -464,6 +538,7 @@ async def process_download(
             or info.get("channel")
             or "unknown"
         )
+
         title = info.get("title") or path.stem
 
         if mode == "audio":
@@ -482,6 +557,7 @@ async def process_download(
                 voice_path,
                 original_message.message_id,
             )
+
         else:
             extension = (
                 path.suffix
@@ -500,6 +576,7 @@ async def process_download(
             if path != final_path:
                 if final_path.exists():
                     final_path.unlink()
+
                 path.rename(final_path)
 
             await send_document_file(
@@ -515,6 +592,15 @@ async def process_download(
             "هو إرسال رابط المنشور"
         )
 
+    except asyncio.CancelledError:
+        try:
+            await status_message.edit_text(
+                "تم إيقاف الطلب"
+            )
+        except Exception:
+            pass
+        raise
+
     except Exception:
         try:
             await status_message.edit_text(
@@ -525,12 +611,9 @@ async def process_download(
             pass
 
     finally:
-        for file in (voice_path, final_path, path):
-            if file and file.exists():
-                try:
-                    file.unlink()
-                except Exception:
-                    pass
+        # تنظيف كل شيء من التخزين
+        # ولا نمس ID-File.sqlite3
+        await clean_download_folder(folder)
 
 
 async def process_youtube_query(
@@ -548,12 +631,10 @@ async def process_youtube_query(
     loop = asyncio.get_running_loop()
 
     try:
-        status_message_text = (
+        await status_message.edit_text(
             f"يتم العثور على {query}\n"
             "اي هذا 0%"
         )
-
-        await status_message.edit_text(status_message_text)
 
         path, info = await asyncio.to_thread(
             search_youtube,
@@ -578,34 +659,45 @@ async def process_youtube_query(
             voice_path,
         )
 
-        await send_voice_file(
+        sent = await send_voice_file(
             bot,
             user_id,
             voice_path,
             original_message.message_id,
         )
 
+        # نخزن file_id فقط إذا تيليجرام رجعه
+        if sent.voice and sent.voice.file_id:
+            save_id_file(
+                sent.voice.file_id,
+                user_id,
+            )
+
         await status_message.edit_text(
             "طلبك نُفذ بدون أدنى مشكلة كل ماعليك\n"
-            "هو إرسال رابط المنشور"
+            "هو إرسال اسم البحث بعد يوت"
         )
+
+    except asyncio.CancelledError:
+        try:
+            await status_message.edit_text(
+                "تم إيقاف الطلب"
+            )
+        except Exception:
+            pass
+        raise
 
     except Exception:
         try:
             await status_message.edit_text(
-                "الرابط غير مدعوم او الموقع مو مدعوم\n"
-                "شم كسي يلا"
+                "ما لكيت نتيجة مناسبة بالبحث\n"
+                "جرب اسم ثاني"
             )
         except Exception:
             pass
 
     finally:
-        for file in (voice_path, path):
-            if file and file.exists():
-                try:
-                    file.unlink()
-                except Exception:
-                    pass
+        await clean_download_folder(folder)
 
 
 async def cleanup_task(user_id, task):
@@ -616,10 +708,7 @@ async def cleanup_task(user_id, task):
             state["tasks"].discard(task)
 
 
-async def run_job(
-    user_id,
-    job,
-):
+async def run_job(user_id, job):
     kind = job[0]
     bot_instance = job[1]
     original_message = job[2]
@@ -627,28 +716,24 @@ async def run_job(
 
     try:
         if kind == "url":
-            url = job[4]
-            mode = job[5]
-
             await process_download(
                 user_id,
-                url,
+                job[4],
                 bot_instance,
-                mode,
+                job[5],
                 original_message,
                 status_message,
             )
 
         elif kind == "youtube":
-            query = job[4]
-
             await process_youtube_query(
                 user_id,
-                query,
+                job[4],
                 bot_instance,
                 original_message,
                 status_message,
             )
+
     finally:
         async with users_lock:
             state = users.get(user_id)
@@ -683,10 +768,7 @@ async def run_job(
                 )
 
 
-async def add_job(
-    user_id,
-    job,
-):
+async def add_job(user_id, job):
     async with users_lock:
         state = get_user_state(user_id)
 
@@ -720,6 +802,7 @@ async def add_job(
                     )
                 )
             )
+
         else:
             await state["queue"].put(job)
 
@@ -741,8 +824,6 @@ async def add_download(
         if total >= MAX_ACTIVE + MAX_QUEUE:
             return
 
-        mode = state["mode"]
-
         status_message = await original_message.reply(
             "يتم العثور على طلبك دادور انتظر\n"
             "اي هذا 0%"
@@ -754,7 +835,7 @@ async def add_download(
             original_message,
             status_message,
             url,
-            mode,
+            state["mode"],
         )
 
         if state["running"] < MAX_ACTIVE:
@@ -779,6 +860,7 @@ async def add_download(
                     )
                 )
             )
+
         else:
             await state["queue"].put(job)
 
@@ -835,8 +917,10 @@ async def add_youtube_query(
                     )
                 )
             )
+
         else:
             await state["queue"].put(job)
+
 
 def make_bot():
     if LOCAL_BOT_API:
@@ -876,6 +960,7 @@ async def notify_startup():
                 "استعملني ؟!",
                 reply_markup=keyboard,
             )
+
         except Exception:
             pass
 
@@ -936,6 +1021,7 @@ async def send_mawlai(callback: CallbackQuery):
         reply,
         reply_markup=keyboard,
     )
+
     await callback.answer()
 
 
@@ -960,6 +1046,7 @@ async def select_normal(callback: CallbackQuery):
     await callback.message.edit_reply_markup(
         reply_markup=keyboard
     )
+
     await callback.answer()
 
 
@@ -970,6 +1057,8 @@ async def text_handler(message):
     if text == "ادت":
         return
 
+    # بحث يوتيوب:
+    # يوت اغنيه حماسيه
     if text.startswith("يوت"):
         query = text[3:].strip()
 
@@ -992,6 +1081,31 @@ async def text_handler(message):
         )
         return
 
+    # ID-File:
+    # عند إرسال file_id يتم إعادة إرسال نفس الملف
+    if text.startswith("ID-File"):
+        file_id = text[7:].strip()
+
+        if file_id:
+            record = get_id_file(file_id)
+
+            if record:
+                try:
+                    await bot.send_voice(
+                        message.chat.id,
+                        voice=file_id,
+                        reply_to_message_id=message.message_id,
+                    )
+                    return
+                except Exception:
+                    pass
+
+        await message.reply(
+            "ID-File غير موجود"
+        )
+        return
+
+    # كل نص غير رابط يأخذ الردود المتناوبة
     if not re.match(r"^https?://", text):
         reply, keyboard = get_rotating_reply(
             message.from_user.id
@@ -1003,7 +1117,16 @@ async def text_handler(message):
         )
         return
 
+    # تجاهل روابط تيليجرام
     if is_telegram_url(text):
+        reply, keyboard = get_rotating_reply(
+            message.from_user.id
+        )
+
+        await message.reply(
+            reply,
+            reply_markup=keyboard,
+        )
         return
 
     await add_download(
@@ -1014,22 +1137,12 @@ async def text_handler(message):
     )
 
 
-@dp.message()
-async def non_text_handler(message):
-    reply, keyboard = get_rotating_reply(
-        message.from_user.id
-    )
-
-    await message.reply(
-        reply,
-        reply_markup=keyboard,
-    )
-
-
 async def main():
+    init_id_file()
     await notify_startup()
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
