@@ -383,7 +383,6 @@ async def live_typing(
         return
 
     current = []
-
     index = 0
     total = len(words)
 
