@@ -14,7 +14,9 @@ from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.types import (
     Message,
     FSInputFile,
-    ReplyParameters
+    ReplyParameters,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -28,6 +30,8 @@ router = Router()
 dp.include_router(router)
 
 DATA_FILE = Path("data.json")
+CACHE_DIR = Path("cached_voices")
+CACHE_DIR.mkdir(exist_ok=True)
 
 DEVELOPER_ID = 8436425159
 
@@ -54,6 +58,20 @@ state_lock = asyncio.Lock()
 
 def new_id():
     return "ID-File-" + uuid.uuid4().hex
+
+
+def get_developer_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="المطور",
+                    url=f"tg://user?id={DEVELOPER_ID}",
+                    style="danger"
+                )
+            ]
+        ]
+    )
 
 
 def load_data():
@@ -208,6 +226,21 @@ def clean_youtube_url(url):
         pass
 
     return url
+
+
+def find_cached_file(url):
+    clean_target = clean_youtube_url(url)
+    for chat_data in settings.values():
+        if isinstance(chat_data, dict):
+            downloads = chat_data.get("downloads", {})
+            for item in downloads.values():
+                if item.get("url") == url or item.get("url") == clean_target:
+                    id_file = item.get("id_file")
+                    if id_file:
+                        cached_path = CACHE_DIR / f"{id_file}.ogg"
+                        if cached_path.exists():
+                            return cached_path
+    return None
 
 
 def yt_options(outtmpl=None):
@@ -411,6 +444,26 @@ async def process_download(item):
     original_message = item["original_message"]
     status_message = item["status_message"]
 
+    cached_file = find_cached_file(url)
+
+    if cached_file:
+        try:
+            await bot.send_voice(
+                chat_id=chat_id,
+                voice=FSInputFile(cached_file),
+                reply_parameters=reply_parameters(
+                    original_message
+                ),
+                reply_markup=get_developer_keyboard()
+            )
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+
     folder = Path(
         tempfile.mkdtemp(
             prefix="voice_"
@@ -423,12 +476,21 @@ async def process_download(item):
             folder
         )
 
+        id_file = new_id()
+        cached_destination = CACHE_DIR / f"{id_file}.ogg"
+
+        try:
+            cached_destination.write_bytes(output.read_bytes())
+        except Exception:
+            pass
+
         await bot.send_voice(
             chat_id=chat_id,
             voice=FSInputFile(output),
             reply_parameters=reply_parameters(
                 original_message
-            )
+            ),
+            reply_markup=get_developer_keyboard()
         )
 
         try:
@@ -448,8 +510,6 @@ async def process_download(item):
                 "downloads",
                 {}
             )
-
-            id_file = new_id()
 
             settings[key]["downloads"][id_file] = {
                 "id_file": id_file,
