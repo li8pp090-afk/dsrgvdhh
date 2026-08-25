@@ -1,1305 +1,1321 @@
-import asyncio
 import os
 import re
-import shutil
-import unicodedata
+import json
+import uuid
+import random
+import asyncio
+import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
-import aiosqlite
 import yt_dlp
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
-from aiogram.filters import CommandStart
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command
+from aiogram.enums import ChatType
 from aiogram.types import (
-    CallbackQuery,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
+    FSInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
-LOCAL_BOT_API = os.getenv("LOCAL_BOT_API", "").strip()
+TOKEN = os.getenv("BOT_TOKEN")
 
-ADMIN_IDS = [
-    8436425159,
-    8255680206,
-    8800673233,
-    8606430342,
-    8845740736,
-    8554632449,
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing")
+
+bot = Bot(TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+DATA_FILE = Path("data.json")
+
+DEVELOPER_ID = 8436425159
+
+ADMINS = {
     8750024481,
-]
+    8554632449,
+    8845740736,
+    8606430342,
+    8800673233,
+    8255680206,
+    8436425159
+}
 
-ROTATING_REPLIES = [
-    "مو ناوي تستعملني مثل البوتات ترى اذا اضوج\nاصيح المولاي يغصص بلاعيمك",
-    "اهو فطستني بسوالفك هاي ديلا دز رابط اريد\nانفذلك طلباتك علمود انام",
-    "ترى يمكن انطيك بلوك واعوفك ملبوس\nها شتكول بيبي",
-]
+DEFAULT_NAME = "تع"
+DEFAULT_URL = f"tg://user?id={DEVELOPER_ID}"
 
-BUTTON_STYLES = ["primary", "success", "danger"]
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
+MAX_URL_LENGTH = 4096
 
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+settings = {}
+waiting = {}
 
-ID_FILE_DB = Path("ID-File.sqlite3")
+queues = {}
+workers = {}
+running = {}
 
-MAX_ACTIVE = 3
-MAX_QUEUE = 3
+state_lock = asyncio.Lock()
 
-sessions = {}
-sessions_lock = asyncio.Lock()
-trim_states = {}
+bot_add_link = ""
 
 
-async def init_id_file():
-    async with aiosqlite.connect(ID_FILE_DB) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS id_files (
-                file_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL
+def new_id():
+    return "ID-File-" + uuid.uuid4().hex
+
+
+def load_data():
+    global settings
+
+    if not DATA_FILE.exists():
+        settings = {}
+        return
+
+    try:
+        settings = json.loads(
+            DATA_FILE.read_text(
+                encoding="utf-8"
             )
-            """
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                chat_type TEXT NOT NULL
-            )
-            """
-        )
-        await db.commit()
+    except Exception:
+        settings = {}
 
 
-async def register_chat(chat_id: int, chat_type: str):
-    async with aiosqlite.connect(ID_FILE_DB) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO chats(chat_id, chat_type) VALUES (?, ?)",
-            (chat_id, chat_type),
-        )
-        await db.commit()
+def save_data():
+    tmp = DATA_FILE.with_suffix(".tmp")
 
-
-async def save_id_file(file_id, user_id):
-    async with aiosqlite.connect(ID_FILE_DB) as db:
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO id_files(file_id, user_id)
-            VALUES (?, ?)
-            """,
-            (file_id, user_id),
-        )
-        await db.commit()
-
-
-async def get_id_file(file_id):
-    async with aiosqlite.connect(ID_FILE_DB) as db:
-        async with db.execute(
-            "SELECT file_id, user_id FROM id_files WHERE file_id = ?",
-            (file_id,),
-        ) as cursor:
-            return await cursor.fetchone()
-
-
-def is_telegram_url(url):
-    match = re.match(r"^https?://([^/]+)", url.lower())
-    if not match:
-        return False
-
-    domain = match.group(1).split(":")[0]
-
-    return (
-        domain == "t.me"
-        or domain.endswith(".t.me")
-        or domain == "telegram.me"
-        or domain.endswith(".telegram.me")
-        or domain == "telegram.dog"
-        or domain.endswith(".telegram.dog")
+    tmp.write_text(
+        json.dumps(
+            settings,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
     )
 
-
-EN_UPPER = set("ATGUFNJML")
-RU_UPPER = set("АИБ")
+    tmp.replace(DATA_FILE)
 
 
-def clean_publisher(name):
-    name = unicodedata.normalize("NFC", name or "")
-    result = []
+def chat_data(chat_id):
+    key = str(chat_id)
 
-    for char in name:
-        if char.isascii() and char.isalpha():
-            upper = char.upper()
-            result.append(
-                upper if upper in EN_UPPER else char.lower()
-            )
-        elif "\u0400" <= char <= "\u04FF":
-            upper = char.upper()
-            result.append(
-                upper if upper in RU_UPPER else char.lower()
-            )
-        elif char.isdigit() or char in "_ ":
-            result.append(char)
-
-    value = "".join(result).strip()
-    return value or "unknown"
-
-
-def clean_title(name):
-    value = unicodedata.normalize("NFC", name or "")
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", value)
-    return value.strip() or "unknown"
-
-
-def make_filename(publisher, title, extension):
-    publisher = clean_publisher(publisher)
-    title = clean_title(title)
-    extension = re.sub(
-        r"[^A-Za-z0-9]+",
-        "",
-        extension.lower(),
-    )
-
-    if not extension:
-        extension = "bin"
-
-    return f"{publisher} - {title}.{extension}"
-
-
-def parse_time_to_seconds(time_str):
-    parts = time_str.split(":")
-    if len(parts) == 2:
-        minutes, seconds = map(int, parts)
-        return minutes * 60 + seconds
-    elif len(parts) == 3:
-        hours, minutes, seconds = map(int, parts)
-        return hours * 3600 + minutes * 60 + seconds
-    return None
-
-
-def format_time_for_ffmpeg(time_str):
-    parts = time_str.split(":")
-    if len(parts) == 2:
-        return f"00:{int(parts[0]):02d}:{int(parts[1]):02d}"
-    elif len(parts) == 3:
-        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
-    return time_str
-
-
-def get_session_state(chat_id: int, user_id: int):
-    key = (chat_id, user_id)
-    if key not in sessions:
-        sessions[key] = {
-            "mode": "normal",
-            "queue": asyncio.Queue(maxsize=MAX_QUEUE),
-            "running": 0,
-            "tasks": set(),
-            "reply_index": 0,
-            "reply_styles": BUTTON_STYLES.copy(),
+    if key not in settings:
+        settings[key] = {
+            "name": {
+                "id_file": new_id(),
+                "value": DEFAULT_NAME
+            },
+            "url": {
+                "id_file": new_id(),
+                "value": DEFAULT_URL
+            },
+            "media": None,
+            "downloads": {}
         }
+        save_data()
 
-    return sessions[key]
+    data = settings[key]
+
+    data.setdefault(
+        "name",
+        {
+            "id_file": new_id(),
+            "value": DEFAULT_NAME
+        }
+    )
+
+    data.setdefault(
+        "url",
+        {
+            "id_file": new_id(),
+            "value": DEFAULT_URL
+        }
+    )
+
+    data.setdefault("media", None)
+    data.setdefault("downloads", {})
+
+    return data
 
 
-def get_rotating_reply(chat_id: int, user_id: int):
-    state = get_session_state(chat_id, user_id)
+def is_admin(user_id):
+    return user_id in ADMINS
 
-    reply = ROTATING_REPLIES[state["reply_index"]]
 
-    state["reply_index"] = (
-        state["reply_index"] + 1
-    ) % len(ROTATING_REPLIES)
-
-    if not state["reply_styles"]:
-        state["reply_styles"] = BUTTON_STYLES.copy()
-
-    button_style = state["reply_styles"].pop(0)
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
+def admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
             [
-                InlineKeyboardButton(
-                    text="مولاي",
-                    url="tg://user?id=8554632449",
-                    style=button_style,
+                KeyboardButton(
+                    text="تغيير اسم الزر"
+                ),
+                KeyboardButton(
+                    text="تعيين رابط الزر"
+                )
+            ],
+            [
+                KeyboardButton(
+                    text="تعيين ميديا الرد"
                 )
             ]
-        ]
+        ],
+        resize_keyboard=True
     )
 
-    return reply, keyboard
 
+def result_keyboard(chat_id):
+    data = chat_data(chat_id)
 
-def mode_keyboard(chat_id: int, user_id: int):
-    mode = get_session_state(chat_id, user_id)["mode"]
+    name = data["name"]["value"] or DEFAULT_NAME
+    url = data["url"]["value"] or DEFAULT_URL
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="صوت",
-                    callback_data="mode_audio",
-                    style=(
-                        "success"
-                        if mode == "audio"
-                        else "danger"
-                    ),
-                ),
-                InlineKeyboardButton(
-                    text="ستيكر",
-                    callback_data="mode_sticker",
-                    style=(
-                        "success"
-                        if mode == "sticker"
-                        else "danger"
-                    ),
-                ),
-                InlineKeyboardButton(
-                    text="الافتراضي",
-                    callback_data="mode_normal",
-                    style=(
-                        "success"
-                        if mode == "normal"
-                        else "danger"
-                    ),
-                ),
+                    text="المطور",
+                    url=f"tg://user?id={DEVELOPER_ID}"
+                )
             ],
+            [
+                InlineKeyboardButton(
+                    text="اضفني",
+                    url=bot_add_link
+                ),
+                InlineKeyboardButton(
+                    text=name,
+                    url=url
+                )
+            ]
         ]
     )
 
 
-async def update_progress(
-    status_message,
-    percent,
-    progress_state,
-    loop,
-):
-    if not percent:
-        return
+def valid_username(value):
+    value = value.strip()
 
-    percent = min(100, max(0, int(percent)))
-    step = (percent // 5) * 5
+    if value.startswith("@"):
+        value = value[1:]
 
-    if step < 10 or step == progress_state["last"]:
-        return
+    if not 5 <= len(value) <= 32:
+        return False
 
-    progress_state["last"] = step
+    if not re.fullmatch(
+        r"[A-Za-z0-9_]+",
+        value
+    ):
+        return False
 
-    async def edit():
-        try:
-            await status_message.edit_text(
-                "يتم العثور على طلبك دادور انتظر\n"
-                f"اي هذا {step}%"
-            )
-        except Exception:
-            pass
+    if value[0].isdigit():
+        return False
 
-    asyncio.run_coroutine_threadsafe(edit(), loop)
+    if value[0] == "_":
+        return False
+
+    if value[-1] == "_":
+        return False
+
+    return True
 
 
-def build_yt_options(fmt, folder, progress_hook):
-    return {
-        "format": fmt,
-        "outtmpl": str(folder / "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "overwrites": True,
-        "socket_timeout": 12,
-        "progress_hooks": [progress_hook],
-    }
+def valid_user_id(value):
+    if not value.isdigit():
+        return False
+
+    try:
+        number = int(value)
+    except Exception:
+        return False
+
+    return 1 <= number <= 999999999999999
 
 
-def download(
-    url,
-    folder,
-    mode,
-    status_message,
-    loop,
-):
-    progress_state = {"last": 0}
+def parse_button_url(value):
+    value = value.strip()
 
-    def progress_hook(data):
-        if data.get("status") != "downloading":
-            return
+    if not value or len(value) > MAX_URL_LENGTH:
+        return None
 
-        total = (
-            data.get("total_bytes")
-            or data.get("total_bytes_estimate")
-        )
-        downloaded = data.get("downloaded_bytes", 0)
+    if valid_user_id(value):
+        return f"tg://user?id={value}"
 
-        if not total:
-            return
+    if valid_username(value):
+        username = value.lstrip("@")
+        return f"https://t.me/{username}"
 
-        percent = downloaded / total * 100
-
-        asyncio.run_coroutine_threadsafe(
-            update_progress(
-                status_message,
-                percent,
-                progress_state,
-                loop,
-            ),
-            loop,
-        )
-
-    if mode == "audio":
-        fmt = "bestaudio/best"
-    elif mode == "sticker":
-        fmt = "bestvideo/best"
-    else:
-        fmt = "bestvideo+bestaudio/best"
-
-    options = build_yt_options(
-        fmt,
-        folder,
-        progress_hook,
+    match = re.fullmatch(
+        r"https?://t\.me/([A-Za-z0-9_]{5,32})/?",
+        value,
+        re.IGNORECASE
     )
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = Path(ydl.prepare_filename(info))
-        return path, info
+    if match and valid_username(
+        match.group(1)
+    ):
+        return f"https://t.me/{match.group(1)}"
+
+    return None
 
 
-def search_youtube(
-    query,
-    folder,
-    status_message,
-    loop,
-):
-    progress_state = {"last": 0}
+def valid_download_url(value):
+    if not value:
+        return False
 
-    def progress_hook(data):
-        if data.get("status") != "downloading":
-            return
+    if len(value) > MAX_URL_LENGTH:
+        return False
 
-        total = (
-            data.get("total_bytes")
-            or data.get("total_bytes_estimate")
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return False
+
+    if parsed.scheme.lower() not in {
+        "http",
+        "https"
+    }:
+        return False
+
+    host = parsed.hostname
+
+    if not host:
+        return False
+
+    host = host.lower()
+
+    if host == "t.me" or host.endswith(".t.me"):
+        return False
+
+    return True
+
+
+def failure_text(kind):
+    ending = random.choice(
+        (
+            "شم كسي يلا",
+            "شم طيزي يلا"
         )
-        downloaded = data.get("downloaded_bytes", 0)
-
-        if not total:
-            return
-
-        percent = downloaded / total * 100
-
-        asyncio.run_coroutine_threadsafe(
-            update_progress(
-                status_message,
-                percent,
-                progress_state,
-                loop,
-            ),
-            loop,
-        )
-
-    search_options = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "socket_timeout": 12,
-    }
-
-    with yt_dlp.YoutubeDL(search_options) as ydl:
-        info = ydl.extract_info(
-            f"ytsearch1:{query}",
-            download=False,
-        )
-
-        entries = info.get("entries") or []
-        if not entries:
-            raise LookupError("No YouTube result")
-
-        video_url = entries[0].get("url") or entries[0].get("webpage_url")
-
-    download_options = build_yt_options(
-        "bestaudio/best",
-        folder,
-        progress_hook,
     )
 
-    with yt_dlp.YoutubeDL(download_options) as ydl:
-        video_info = ydl.extract_info(video_url, download=True)
-        downloaded_path = Path(ydl.prepare_filename(video_info))
-
-        if not downloaded_path.exists():
-            for file in folder.glob(f"{downloaded_path.stem}.*"):
-                downloaded_path = file
-                break
-
-        return downloaded_path, video_info
-
-
-async def convert_to_voice(
-    input_path,
-    output_path,
-):
-    async with asyncio.timeout(12):
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-vn",
-            "-c:a",
-            "libopus",
-            str(output_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+    if kind == "youtube":
+        return (
+            "اليوت غير مدعوم او العنوان غير متوفر\n"
+            f"{ending}"
         )
 
-        code = await process.wait()
-
-        if code != 0 or not output_path.exists():
-            raise RuntimeError(
-                "FFmpeg voice conversion failed"
-            )
+    return (
+        "الرابط غير مدعوم او الرابط غير مدعوم\n"
+        f"{ending}"
+    )
 
 
-async def trim_voice(
-    input_path,
-    output_path,
-    start_str,
-    end_str,
-):
-    start_formatted = format_time_for_ffmpeg(start_str)
-    end_formatted = format_time_for_ffmpeg(end_str)
+async def cleanup(folder):
+    try:
+        if not folder.exists():
+            return
 
-    async with asyncio.timeout(12):
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-ss",
-            start_formatted,
-            "-to",
-            end_formatted,
-            "-i",
-            str(input_path),
-            "-vn",
-            "-c:a",
-            "libopus",
-            str(output_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-
-        code = await process.wait()
-
-        if code != 0 or not output_path.exists():
-            raise RuntimeError(
-                "FFmpeg trim failed"
-            )
-
-
-async def convert_to_sticker(
-    input_path,
-    output_path,
-):
-    async with asyncio.timeout(12):
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-an",
-            "-c:v",
-            "copy",
-            str(output_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-
-        code = await process.wait()
-
-        if code != 0 or not output_path.exists():
-            raise RuntimeError(
-                "FFmpeg sticker conversion failed"
-            )
-
-
-async def send_voice_file(
-    bot,
-    target_id,
-    path,
-    reply_to,
-):
-    async with asyncio.timeout(12):
-        message = await bot.send_voice(
-            chat_id=target_id,
-            voice=FSInputFile(path),
-            reply_to_message_id=reply_to,
-        )
-        return message
-
-
-async def send_animation_file(
-    bot,
-    target_id,
-    path,
-    reply_to,
-):
-    async with asyncio.timeout(12):
-        message = await bot.send_animation(
-            chat_id=target_id,
-            animation=FSInputFile(path),
-            reply_to_message_id=reply_to,
-        )
-        return message
-
-
-async def send_document_file(
-    bot,
-    target_id,
-    path,
-    filename,
-    reply_to,
-):
-    async with asyncio.timeout(12):
-        return await bot.send_document(
-            chat_id=target_id,
-            document=FSInputFile(
-                path,
-                filename=filename,
-            ),
-            reply_to_message_id=reply_to,
-        )
-
-
-async def clean_download_folder(folder):
-    if not folder.exists():
-        return
-
-    for item in folder.iterdir():
-        try:
+        for item in folder.iterdir():
             if item.is_file() or item.is_symlink():
-                item.unlink()
+                try:
+                    item.unlink()
+                except Exception:
+                    pass
+
             elif item.is_dir():
-                shutil.rmtree(item)
-        except Exception:
-            pass
+                await cleanup(item)
 
-
-async def process_download(
-    chat_id,
-    user_id,
-    url,
-    bot,
-    mode,
-    original_message,
-    status_message,
-):
-    folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
-    folder.mkdir(parents=True, exist_ok=True)
-
-    path = None
-    voice_path = None
-    sticker_path = None
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        async with asyncio.timeout(12):
-            path, info = await asyncio.to_thread(
-                download,
-                url,
-                folder,
-                mode,
-                status_message,
-                loop,
-            )
-
-        publisher = (
-            info.get("uploader")
-            or info.get("channel")
-            or "unknown"
-        )
-
-        title = info.get("title") or path.stem
-
-        if mode == "audio":
-            voice_path = folder / (
-                f"{clean_publisher(publisher)}.ogg"
-            )
-
-            await convert_to_voice(
-                path,
-                voice_path,
-            )
-
-            sent = await send_voice_file(
-                bot,
-                chat_id,
-                voice_path,
-                original_message.message_id,
-            )
-
-            if sent.voice and sent.voice.file_id:
-                await save_id_file(
-                    sent.voice.file_id,
-                    user_id,
-                )
-
-        elif mode == "sticker":
-            sticker_path = folder / "animation.mp4"
-
-            await convert_to_sticker(
-                path,
-                sticker_path,
-            )
-
-            await send_animation_file(
-                bot,
-                chat_id,
-                sticker_path,
-                original_message.message_id,
-            )
-
-        else:
-            extension = (
-                path.suffix
-                .lstrip(".")
-                .lower()
-            )
-
-            filename = make_filename(
-                publisher,
-                title,
-                extension,
-            )
-
-            await send_document_file(
-                bot,
-                chat_id,
-                path,
-                filename,
-                original_message.message_id,
-            )
-
-        await status_message.edit_text(
-            "طلبك نُفذ بدون أدنى مشكلة كل ماعليك\n"
-            "هو إرسال رابط المنشور"
-        )
-
-    except asyncio.CancelledError:
         try:
-            await status_message.edit_text(
-                "الرابط غير مدعوم او الموقع مو مدعوم\n"
-                "شم كسي يلا"
-            )
+            folder.rmdir()
         except Exception:
             pass
-        raise
-
-    except Exception:
-        try:
-            await status_message.edit_text(
-                "الرابط غير مدعوم او الموقع مو مدعوم\n"
-                "شم كسي يلا"
-            )
-        except Exception:
-            pass
-
-    finally:
-        await clean_download_folder(folder)
-
-
-async def process_youtube_query(
-    chat_id,
-    user_id,
-    query,
-    bot,
-    original_message,
-    status_message,
-):
-    folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
-    folder.mkdir(parents=True, exist_ok=True)
-
-    path = None
-    voice_path = None
-    loop = asyncio.get_running_loop()
-
-    try:
-        await status_message.edit_text(
-            f"يتم العثور على {query}\n"
-            "اي هذا 0%"
-        )
-
-        async with asyncio.timeout(12):
-            path, info = await asyncio.to_thread(
-                search_youtube,
-                query,
-                folder,
-                status_message,
-                loop,
-            )
-
-        publisher = (
-            info.get("uploader")
-            or info.get("channel")
-            or "unknown"
-        )
-
-        voice_path = folder / (
-            f"{clean_publisher(publisher)}.ogg"
-        )
-
-        await convert_to_voice(
-            path,
-            voice_path,
-        )
-
-        sent = await send_voice_file(
-            bot,
-            chat_id,
-            voice_path,
-            original_message.message_id,
-        )
-
-        if sent.voice and sent.voice.file_id:
-            await save_id_file(
-                sent.voice.file_id,
-                user_id,
-            )
-
-        await status_message.edit_text(
-            "طلبك نُفذ بدون أدنى مشكلة كل ماعليك\n"
-            "هو إرسال اسم البحث بعد يوت"
-        )
-
-    except asyncio.CancelledError:
-        try:
-            await status_message.edit_text(
-                "الرابط غير مدعوم او الموقع مو مدعوم\n"
-                "شم كسي يلا"
-            )
-        except Exception:
-            pass
-        raise
-
-    except Exception:
-        try:
-            await status_message.edit_text(
-                "الرابط غير مدعوم او الموقع مو مدعوم\n"
-                "شم كسي يلا"
-            )
-        except Exception:
-            pass
-
-    finally:
-        await clean_download_folder(folder)
-
-
-async def cleanup_task(key, task):
-    async with sessions_lock:
-        state = sessions.get(key)
-
-        if state:
-            state["tasks"].discard(task)
-
-
-async def run_job(key, job):
-    kind = job[0]
-    bot_instance = job[1]
-    original_message = job[2]
-    status_message = job[3]
-    chat_id, user_id = key
-
-    try:
-        if kind == "url":
-            await process_download(
-                chat_id,
-                user_id,
-                job[4],
-                bot_instance,
-                job[5],
-                original_message,
-                status_message,
-            )
-
-        elif kind == "youtube":
-            await process_youtube_query(
-                chat_id,
-                user_id,
-                job[4],
-                bot_instance,
-                original_message,
-                status_message,
-            )
-
-    finally:
-        async with sessions_lock:
-            state = sessions.get(key)
-
-            if not state:
-                return
-
-            state["running"] -= 1
-
-            if not state["queue"].empty():
-                next_job = await state["queue"].get()
-                state["running"] += 1
-
-                task = asyncio.create_task(
-                    run_job(
-                        key,
-                        next_job,
-                    )
-                )
-
-                state["tasks"].add(task)
-
-                task.add_done_callback(
-                    lambda done_task,
-                    k=key:
-                    asyncio.create_task(
-                        cleanup_task(
-                            k,
-                            done_task,
-                        )
-                    )
-                )
-
-
-async def add_job(chat_id, user_id, job):
-    key = (chat_id, user_id)
-    async with sessions_lock:
-        state = get_session_state(chat_id, user_id)
-
-        total = (
-            state["running"]
-            + state["queue"].qsize()
-        )
-
-        if total >= MAX_ACTIVE + MAX_QUEUE:
-            return
-
-        if state["running"] < MAX_ACTIVE:
-            state["running"] += 1
-
-            task = asyncio.create_task(
-                run_job(
-                    key,
-                    job,
-                )
-            )
-
-            state["tasks"].add(task)
-
-            task.add_done_callback(
-                lambda done_task,
-                k=key:
-                asyncio.create_task(
-                    cleanup_task(
-                        k,
-                        done_task,
-                    )
-                )
-            )
-
-        else:
-            await state["queue"].put(job)
-
-
-async def add_download(
-    chat_id,
-    user_id,
-    url,
-    bot_instance,
-    original_message,
-):
-    status_message = await original_message.reply(
-        "يتم العثور على طلبك دادور انتظر\n"
-        "اي هذا 0%"
-    )
-
-    state = get_session_state(chat_id, user_id)
-
-    job = (
-        "url",
-        bot_instance,
-        original_message,
-        status_message,
-        url,
-        state["mode"],
-    )
-
-    await add_job(chat_id, user_id, job)
-
-
-async def add_youtube_query(
-    chat_id,
-    user_id,
-    query,
-    bot_instance,
-    original_message,
-):
-    status_message = await original_message.reply(
-        f"يتم العثور على {query}\n"
-        "اي هذا 0%"
-    )
-
-    job = (
-        "youtube",
-        bot_instance,
-        original_message,
-        status_message,
-        query,
-    )
-
-    await add_job(chat_id, user_id, job)
-
-
-def make_bot():
-    if LOCAL_BOT_API:
-        session = AiohttpSession(
-            api=TelegramAPIServer.from_base(
-                LOCAL_BOT_API,
-                is_local=True,
-            )
-        )
-        return Bot(TOKEN, session=session)
-
-    return Bot(TOKEN)
-
-
-bot = make_bot()
-dp = Dispatcher()
-
-
-async def notify_startup():
-    target_admin_id = 8554632449
-    try:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="رب العالمين",
-                        url=f"tg://user?id={target_admin_id}",
-                        style="primary",
-                    )
-                ]
-            ]
-        )
-
-        await bot.send_message(
-            target_admin_id,
-            "اشتغل البوت مرتلخ\n"
-            "استعملني ؟!",
-            reply_markup=keyboard,
-        )
 
     except Exception:
         pass
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
-    await register_chat(message.chat.id, message.chat.type)
-    reply, keyboard = get_rotating_reply(
-        message.chat.id,
-        message.from_user.id,
-    )
+async def youtube_search(query):
+    if not query or len(query) > 300:
+        raise RuntimeError()
 
-    await message.reply(
-        reply,
-        reply_markup=keyboard,
-    )
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "noplaylist": True,
+        "socket_timeout": 20
+    }
 
-
-@dp.message(F.text == "ادت")
-async def download_settings(message: Message):
-    await register_chat(message.chat.id, message.chat.type)
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    async with sessions_lock:
-        get_session_state(chat_id, user_id)
-
-    await message.reply(
-        "تستطيع تغيير وضع عمل البوت من صوت الى\n"
-        "الوضع الافتراضي من هذه الأزرار",
-        reply_markup=mode_keyboard(chat_id, user_id),
-    )
-
-
-@dp.callback_query(F.data == "mode_audio")
-async def select_audio(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-
-    async with sessions_lock:
-        state = get_session_state(chat_id, user_id)
-
-        if state["mode"] == "audio":
-            state["mode"] = "normal"
-        else:
-            state["mode"] = "audio"
-
-        keyboard = mode_keyboard(chat_id, user_id)
-
-    await callback.message.edit_reply_markup(
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "mode_sticker")
-async def select_sticker(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-
-    async with sessions_lock:
-        state = get_session_state(chat_id, user_id)
-
-        if state["mode"] == "sticker":
-            state["mode"] = "normal"
-        else:
-            state["mode"] = "sticker"
-
-        keyboard = mode_keyboard(chat_id, user_id)
-
-    await callback.message.edit_reply_markup(
-        reply_markup=keyboard
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "mode_normal")
-async def select_normal(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-
-    async with sessions_lock:
-        state = get_session_state(chat_id, user_id)
-
-        if state["mode"] == "normal":
-            await callback.answer(
-                "لا يمكنك تعطيل الوضع الافتراضي\n"
-                "تستطيع تبديل الوضع وليس تعطيل كل الاوضاع",
-                show_alert=True,
+    def search():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            result = ydl.extract_info(
+                f"ytsearch1:{query}",
+                download=False
             )
-            return
 
-        state["mode"] = "normal"
-        keyboard = mode_keyboard(chat_id, user_id)
+        entries = result.get("entries") or []
 
-    await callback.message.edit_reply_markup(
-        reply_markup=keyboard
-    )
+        if not entries:
+            raise RuntimeError()
 
-    await callback.answer()
+        entry = entries[0]
 
-
-@dp.message(
-    F.reply_to_message
-    & F.reply_to_message.voice
-    & (F.text.lower() == "تعديل")
-)
-async def start_trim_from_reply(message: Message):
-    await register_chat(message.chat.id, message.chat.type)
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    voice = message.reply_to_message.voice
-
-    record = await get_id_file(voice.file_id)
-
-    if not record:
-        await message.reply(
-            "المعذرة\n"
-            "لا يتوفر iD-File للرد"
+        url = (
+            entry.get("webpage_url")
+            or entry.get("url")
         )
+
+        if not url:
+            raise RuntimeError()
+
+        return url
+
+    return await asyncio.to_thread(search)
+
+
+async def live_typing(
+    message,
+    words,
+    stop_event
+):
+    if not words:
         return
 
-    trim_states[(chat_id, user_id)] = {
-        "file_id": voice.file_id,
-        "duration": voice.duration or 0,
-    }
+    current = []
 
-    await message.reply(
-        "اذا اردت تعديل المدة هكذا للدقائق\n"
-        "00:20 00:10 وللساعات 00.0:00"
-    )
+    index = 0
+    total = len(words)
 
+    while not stop_event.is_set():
+        count = random.randint(3, 6)
 
-@dp.message(F.voice)
-async def start_trim_from_voice_upload(message: Message):
-    await register_chat(message.chat.id, message.chat.type)
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    voice = message.voice
+        for _ in range(count):
+            if index >= total:
+                index = 0
 
-    trim_states[(chat_id, user_id)] = {
-        "file_id": voice.file_id,
-        "duration": voice.duration or 0,
-    }
+            current.append(words[index])
+            index += 1
 
-    await message.reply(
-        "اذا اردت تعديل المدة هكذا للدقائق\n"
-        "00:20 00:10 وللساعات 00.0:00"
-    )
+        text = " ".join(current)
 
-
-@dp.message(F.text)
-async def text_handler(message: Message):
-    await register_chat(message.chat.id, message.chat.type)
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    text = message.text.strip()
-    key = (chat_id, user_id)
-
-    if key in trim_states:
-        state_data = trim_states.pop(key)
-
-        time_match = re.match(
-            r"^(\d{1,2}:\d{2}(?::\d{2})?)\s+(\d{1,2}:\d{2}(?::\d{2})?)$",
-            text,
-        )
-
-        if not time_match:
-            await message.reply(
-                "توقيتك غلط تستطيع التعديل هكذا للدقائق\n"
-                "00:20 00:10 وللساعات 00.0:00"
-            )
-            return
-
-        start_str, end_str = time_match.groups()
-        start_sec = parse_time_to_seconds(start_str)
-        end_sec = parse_time_to_seconds(end_str)
-        duration = state_data["duration"]
-
-        if start_sec is None or end_sec is None or start_sec >= end_sec:
-            await message.reply(
-                "توقيتك غلط تستطيع التعديل هكذا للدقائق\n"
-                "00:20 00:10 وللساعات 00.0:00"
-            )
-            return
-
-        if duration > 0 and (start_sec >= duration or end_sec > duration):
-            await message.reply(
-                "توقيتك اكبر من الفويس ارسل مدة اقصر\n"
-                "ههع يلا"
-            )
-            return
-
-        folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
-        folder.mkdir(parents=True, exist_ok=True)
-
-        input_voice_path = folder / "input.ogg"
-        output_voice_path = folder / "trimmed.ogg"
+        if len(text) > 3900:
+            current = current[-30:]
+            text = " ".join(current)
 
         try:
-            file_info = await bot.get_file(state_data["file_id"])
-            await bot.download_file(
-                file_info.file_path,
-                destination=input_voice_path,
+            await message.edit_text(
+                text
+            )
+        except Exception:
+            pass
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=0.3
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
+async def download_voice(url, folder):
+    source = folder / "source.%(ext)s"
+    output = folder / "voice.ogg"
+
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": str(source),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "max_filesize": MAX_DOWNLOAD_SIZE,
+        "continuedl": False,
+        "overwrites": True
+    }
+
+    def download():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                url,
+                download=True
             )
 
-            await trim_voice(
-                input_voice_path,
-                output_voice_path,
-                start_str,
-                end_str,
+            return Path(
+                ydl.prepare_filename(info)
             )
 
-            sent = await send_voice_file(
-                bot,
+    source_file = await asyncio.to_thread(
+        download
+    )
+
+    if not source_file.exists():
+        candidates = [
+            x for x in folder.iterdir()
+            if x.is_file()
+            and x.suffix.lower()
+            not in {".part", ".ytdl"}
+        ]
+
+        if not candidates:
+            raise RuntimeError()
+
+        source_file = candidates[0]
+
+    if source_file.stat().st_size > MAX_DOWNLOAD_SIZE:
+        raise RuntimeError()
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(source_file),
+        "-vn",
+        "-c:a",
+        "libopus",
+        "-vbr",
+        "on",
+        "-application",
+        "audio",
+        "-f",
+        "ogg",
+        str(output),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+
+    await process.wait()
+
+    if process.returncode != 0:
+        raise RuntimeError()
+
+    if not output.exists():
+        raise RuntimeError()
+
+    if output.stat().st_size > MAX_DOWNLOAD_SIZE:
+        raise RuntimeError()
+
+    return output
+
+
+async def process_download(item):
+    chat_id = item["chat_id"]
+    url = item["url"]
+    query = item["query"]
+    source_type = item["type"]
+    status_message = item["message"]
+
+    folder = Path(
+        tempfile.mkdtemp(
+            prefix="voice_"
+        )
+    )
+
+    stop_event = asyncio.Event()
+
+    words = (
+        status_message.text or ""
+    ).replace(
+        "\n",
+        " "
+    ).split()
+
+    typing_task = asyncio.create_task(
+        live_typing(
+            status_message,
+            words,
+            stop_event
+        )
+    )
+
+    try:
+        output = await download_voice(
+            url,
+            folder
+        )
+
+        stop_event.set()
+
+        await typing_task
+
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+        sent = await bot.send_voice(
+            chat_id=chat_id,
+            voice=FSInputFile(output),
+            reply_markup=result_keyboard(
+                chat_id
+            )
+        )
+
+        file_id = None
+
+        if sent.voice:
+            file_id = sent.voice.file_id
+
+        async with state_lock:
+            data = chat_data(chat_id)
+
+            id_file = new_id()
+
+            data["downloads"][id_file] = {
+                "id_file": id_file,
+                "type": source_type,
+                "query": query,
+                "url": url,
+                "telegram_file_id": file_id
+            }
+
+            save_data()
+
+    except Exception:
+        stop_event.set()
+
+        try:
+            await typing_task
+        except Exception:
+            pass
+
+        try:
+            await status_message.edit_text(
+                failure_text(
+                    source_type
+                )
+            )
+        except Exception:
+            pass
+
+    finally:
+        stop_event.set()
+
+        if not typing_task.done():
+            typing_task.cancel()
+
+        await cleanup(folder)
+
+
+async def worker(chat_id):
+    try:
+        while True:
+            async with state_lock:
+                queue = queues.get(
+                    chat_id,
+                    []
+                )
+
+                if not queue:
+                    workers.pop(
+                        chat_id,
+                        None
+                    )
+                    return
+
+                item = queue.pop(0)
+
+                running[chat_id] = (
+                    running.get(
+                        chat_id,
+                        0
+                    ) + 1
+                )
+
+            try:
+                await process_download(
+                    item
+                )
+
+            finally:
+                async with state_lock:
+                    current = (
+                        running.get(
+                            chat_id,
+                            0
+                        ) - 1
+                    )
+
+                    if current <= 0:
+                        running.pop(
+                            chat_id,
+                            None
+                        )
+                    else:
+                        running[chat_id] = current
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception:
+        workers.pop(
+            chat_id,
+            None
+        )
+
+
+async def start_worker(chat_id):
+    worker_task = workers.get(chat_id)
+
+    if (
+        worker_task
+        and not worker_task.done()
+    ):
+        return
+
+    workers[chat_id] = asyncio.create_task(
+        worker(chat_id)
+    )
+
+
+async def add_download(
+    chat_id,
+    url,
+    query,
+    source_type,
+    status_message
+):
+    async with state_lock:
+        active = running.get(
+            chat_id,
+            0
+        )
+
+        queued = len(
+            queues.get(
                 chat_id,
-                output_voice_path,
-                message.message_id,
+                []
+            )
+        )
+
+        if active >= 3 and queued >= 3:
+            return False
+
+        if active + queued >= 6:
+            return False
+
+        queues.setdefault(
+            chat_id,
+            []
+        ).append(
+            {
+                "chat_id": chat_id,
+                "url": url,
+                "query": query,
+                "type": source_type,
+                "message": status_message
+            }
+        )
+
+        await start_worker(
+            chat_id
+        )
+
+        return True
+
+
+async def send_saved_media(message):
+    data = chat_data(
+        message.chat.id
+    )
+
+    media = data.get("media")
+
+    if not media:
+        return
+
+    file_id = media.get("file_id")
+    kind = media.get("type")
+
+    if not file_id:
+        return
+
+    markup = result_keyboard(
+        message.chat.id
+    )
+
+    try:
+        if kind == "voice":
+            await message.answer_voice(
+                voice=file_id,
+                reply_markup=markup
             )
 
-            if sent.voice and sent.voice.file_id:
-                await save_id_file(
-                    sent.voice.file_id,
-                    user_id,
+        elif kind == "photo":
+            await message.answer_photo(
+                photo=file_id,
+                reply_markup=markup
+            )
+
+        elif kind == "video":
+            await message.answer_video(
+                video=file_id,
+                reply_markup=markup
+            )
+
+        elif kind == "animation":
+            await message.answer_animation(
+                animation=file_id,
+                reply_markup=markup
+            )
+
+    except Exception:
+        pass
+
+
+@router.message(Command("ادت"))
+@router.message(F.text == "ادت")
+async def edit_command(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    await message.answer(
+        "",
+        reply_markup=admin_keyboard()
+    )
+
+
+@router.message(F.text == "تغيير اسم الزر")
+async def change_name(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    data = chat_data(
+        message.chat.id
+    )
+
+    name = data["name"]["value"]
+
+    waiting[
+        message.from_user.id
+    ] = {
+        "type": "name",
+        "chat_id": message.chat.id
+    }
+
+    await message.answer(
+        f"تريد تغير اسم زر {name}\n"
+        "انطيني يلا"
+    )
+
+
+@router.message(F.text == "تعيين رابط الزر")
+async def change_url(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    data = chat_data(
+        message.chat.id
+    )
+
+    name = data["name"]["value"]
+
+    waiting[
+        message.from_user.id
+    ] = {
+        "type": "url",
+        "chat_id": message.chat.id
+    }
+
+    await message.answer(
+        f"تريد تعين رابط زر {name}\n"
+        "انطيني يلا"
+    )
+
+
+@router.message(F.text == "تعيين ميديا الرد")
+async def set_media(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    waiting[
+        message.from_user.id
+    ] = {
+        "type": "media",
+        "chat_id": message.chat.id
+    }
+
+    await message.answer(
+        "أرسل نوع من أنواع الوسائط\n"
+        "فويس / صورة / فيديو / ستيكر"
+    )
+
+
+@router.message(Command("تعطيل_اليوت"))
+@router.message(F.text == "تعطيل اليوت")
+async def disable_youtube(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    settings.setdefault(
+        "_global",
+        {}
+    )
+
+    settings[
+        "_global"
+    ]["private_youtube"] = False
+
+    save_data()
+
+
+@router.message(Command("تفعيل_اليوت"))
+@router.message(F.text == "تفعيل اليوت")
+async def enable_youtube(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    settings.setdefault(
+        "_global",
+        {}
+    )
+
+    settings[
+        "_global"
+    ]["private_youtube"] = True
+
+    save_data()
+
+
+async def handle_message(message: Message):
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    task = waiting.get(user_id)
+
+    if (
+        task
+        and task["chat_id"]
+        == message.chat.id
+    ):
+        if not is_admin(user_id):
+            waiting.pop(
+                user_id,
+                None
+            )
+            return
+
+        if task["type"] == "name":
+            waiting.pop(
+                user_id,
+                None
+            )
+
+            if not message.text:
+                return
+
+            name = message.text.strip()
+
+            if not name or len(name) > 64:
+                return
+
+            data = chat_data(
+                message.chat.id
+            )
+
+            data["name"] = {
+                "id_file": new_id(),
+                "value": name
+            }
+
+            save_data()
+            return
+
+        if task["type"] == "url":
+            waiting.pop(
+                user_id,
+                None
+            )
+
+            value = (
+                message.text or ""
+            ).strip()
+
+            url = parse_button_url(
+                value
+            )
+
+            if not url:
+                await message.answer(
+                    "اهو فطستني بسوالفك هاي ديلا دز يوزر لو ايدي لو رابط اريد\n"
+                    "انفذلك طلباتك علمود انام"
+                )
+                return
+
+            data = chat_data(
+                message.chat.id
+            )
+
+            data["url"] = {
+                "id_file": new_id(),
+                "value": url
+            }
+
+            save_data()
+            return
+
+        if task["type"] == "media":
+            waiting.pop(
+                user_id,
+                None
+            )
+
+            media = None
+
+            if message.voice:
+                media = {
+                    "id_file": new_id(),
+                    "type": "voice",
+                    "file_id":
+                        message.voice.file_id
+                }
+
+            elif message.photo:
+                media = {
+                    "id_file": new_id(),
+                    "type": "photo",
+                    "file_id":
+                        message.photo[-1].file_id
+                }
+
+            elif message.video:
+                media = {
+                    "id_file": new_id(),
+                    "type": "video",
+                    "file_id":
+                        message.video.file_id
+                }
+
+            elif message.animation:
+                media = {
+                    "id_file": new_id(),
+                    "type": "animation",
+                    "file_id":
+                        message.animation.file_id
+                }
+
+            if media:
+                data = chat_data(
+                    message.chat.id
+                )
+
+                data["media"] = media
+                save_data()
+
+            return
+
+    if (
+        message.text
+        and message.text.startswith("يوت")
+    ):
+        query = message.text[3:].strip()
+
+        if not query:
+            return
+
+        try:
+            status = await message.answer(
+                f"¹# - بدأت بالعثور ع {query} امهلني\n"
+                "قليلا فضلا وليس امرا"
+            )
+
+            url = await youtube_search(
+                query
+            )
+
+            accepted = await add_download(
+                message.chat.id,
+                url,
+                query,
+                "youtube",
+                status
+            )
+
+            if not accepted:
+                await status.edit_text(
+                    failure_text(
+                        "youtube"
+                    )
                 )
 
         except Exception:
-            await message.reply(
-                "المعذرة لم استطع تعديل مدة الصوت\n"
-                "انا اسف"
+            try:
+                await message.answer(
+                    failure_text(
+                        "youtube"
+                    )
+                )
+            except Exception:
+                pass
+
+        return
+
+    if (
+        message.text
+        and message.text.startswith(
+            (
+                "http://",
+                "https://"
             )
-        finally:
-            await clean_download_folder(folder)
-        return
+        )
+    ):
+        url = message.text.strip()
 
-    if text == "ادت":
-        return
-
-    if text.startswith("يوت"):
-        query = text[3:].strip()
-
-        if query:
-            await add_youtube_query(
-                chat_id,
-                user_id,
-                query,
-                bot,
-                message,
+        if not valid_download_url(url):
+            await message.answer(
+                failure_text(
+                    "url"
+                )
             )
             return
 
-        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
-        if not is_group_or_channel or "بوت" in text:
-            reply, keyboard = get_rotating_reply(chat_id, user_id)
-            await message.reply(reply, reply_markup=keyboard)
-        return
+        try:
+            status = await message.answer(
+                "بدأت بالعثور ع طلبك امهلني\n"
+                "قليلا فضلا وليس امرا"
+            )
 
-    if text.startswith("ID-File"):
-        file_id = text[7:].strip()
+            accepted = await add_download(
+                message.chat.id,
+                url,
+                url,
+                "url",
+                status
+            )
 
-        if file_id:
-            record = await get_id_file(file_id)
-
-            if record:
-                try:
-                    await bot.send_voice(
-                        message.chat.id,
-                        voice=file_id,
-                        reply_to_message_id=message.message_id,
+            if not accepted:
+                await status.edit_text(
+                    failure_text(
+                        "url"
                     )
-                    return
-                except Exception:
-                    pass
+                )
 
-        await message.reply(
-            "المعذرة\n"
-            "لا يتوفر iD-File للرد"
-        )
+        except Exception:
+            try:
+                await message.answer(
+                    failure_text(
+                        "url"
+                    )
+                )
+            except Exception:
+                pass
+
         return
 
-    if not re.match(r"^https?://", text):
-        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
-        if not is_group_or_channel or "بوت" in text:
-            reply, keyboard = get_rotating_reply(chat_id, user_id)
-            await message.reply(reply, reply_markup=keyboard)
-        return
-
-    if is_telegram_url(text):
-        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
-        if not is_group_or_channel or "بوت" in text:
-            reply, keyboard = get_rotating_reply(chat_id, user_id)
-            await message.reply(reply, reply_markup=keyboard)
-        return
-
-    await add_download(
-        chat_id,
-        user_id,
-        text,
-        bot,
-        message,
+    await send_saved_media(
+        message
     )
 
 
+@router.message()
+async def group_handler(message: Message):
+    await handle_message(message)
+
+
+@router.channel_post()
+async def channel_handler(message: Message):
+    if (
+        message.text
+        and message.text.startswith("يوت")
+    ):
+        query = message.text[3:].strip()
+
+        if not query:
+            return
+
+        try:
+            status = await message.answer(
+                f"¹# - بدأت بالعثور ع {query} امهلني\n"
+                "قليلا فضلا وليس امرا"
+            )
+
+            url = await youtube_search(
+                query
+            )
+
+            accepted = await add_download(
+                message.chat.id,
+                url,
+                query,
+                "youtube",
+                status
+            )
+
+            if not accepted:
+                await status.edit_text(
+                    failure_text(
+                        "youtube"
+                    )
+                )
+
+        except Exception:
+            try:
+                await message.answer(
+                    failure_text(
+                        "youtube"
+                    )
+                )
+            except Exception:
+                pass
+
+        return
+
+    if (
+        message.text
+        and message.text.startswith(
+            (
+                "http://",
+                "https://"
+            )
+        )
+    ):
+        url = message.text.strip()
+
+        if not valid_download_url(url):
+            await message.answer(
+                failure_text(
+                    "url"
+                )
+            )
+            return
+
+        try:
+            status = await message.answer(
+                "بدأت بالعثور ع طلبك امهلني\n"
+                "قليلا فضلا وليس امرا"
+            )
+
+            accepted = await add_download(
+                message.chat.id,
+                url,
+                url,
+                "url",
+                status
+            )
+
+            if not accepted:
+                await status.edit_text(
+                    failure_text(
+                        "url"
+                    )
+                )
+
+        except Exception:
+            try:
+                await message.answer(
+                    failure_text(
+                        "url"
+                    )
+                )
+            except Exception:
+                pass
+
+        return
+
+    await send_saved_media(
+        message
+    )
+
+
+async def startup_message():
+    for user_id in ADMINS:
+        try:
+            await bot.send_message(
+                user_id,
+                "اشتغل البوت مرتلخ\n"
+                "استعملني ؟!"
+            )
+        except Exception:
+            pass
+
+
 async def main():
-    await init_id_file()
-    await notify_startup()
-    await dp.start_polling(bot)
+    global bot_add_link
+
+    load_data()
+
+    me = await bot.get_me()
+
+    bot_add_link = (
+        f"https://t.me/{me.username}"
+        "?startgroup=true"
+    )
+
+    await startup_message()
+
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message",
+            "channel_post"
+        ]
+    )
 
 
 if __name__ == "__main__":
