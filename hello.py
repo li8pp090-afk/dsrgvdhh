@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
 from aiogram.enums import ChatType
@@ -16,8 +17,6 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     ReplyParameters
 )
 
@@ -33,7 +32,7 @@ dp.include_router(router)
 
 DATA_FILE = Path("data.json")
 
-OWNER_ID = 8436425159
+DEVELOPER_ID = 8436425159
 
 ADMINS = {
     8750024481,
@@ -47,18 +46,13 @@ ADMINS = {
 
 MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
 MAX_URL_LENGTH = 4096
-MAX_QUERY_LENGTH = 300
 
 settings = {}
-waiting = {}
-
 queues = {}
 workers = {}
 running = {}
 
 state_lock = asyncio.Lock()
-
-bot_add_link = ""
 
 
 def new_id():
@@ -101,11 +95,9 @@ def is_admin(user_id):
     return user_id in ADMINS
 
 
-def is_allowed_chat(message):
-    return message.chat.type in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-        ChatType.CHANNEL
+def reply_parameters(message):
+    return ReplyParameters(
+        message_id=message.message_id
     )
 
 
@@ -115,16 +107,30 @@ def owner_keyboard():
             [
                 InlineKeyboardButton(
                     text="المالك",
-                    url=f"tg://user?id={OWNER_ID}"
+                    url=f"tg://user?id={DEVELOPER_ID}"
                 )
             ]
         ]
     )
 
 
-def reply_parameters(message):
-    return ReplyParameters(
-        message_id=message.message_id
+def failure_text(kind):
+    ending = random.choice(
+        (
+            "شم كسي يلا",
+            "شم طيزي يلا"
+        )
+    )
+
+    if kind == "youtube":
+        return (
+            "اليوت غير مدعوم او العنوان غير متوفر\n"
+            f"{ending}"
+        )
+
+    return (
+        "الرابط غير مدعوم او الرابط غير متوفر\n"
+        f"{ending}"
     )
 
 
@@ -153,35 +159,42 @@ def valid_download_url(value):
 
     host = host.lower()
 
-    if (
-        host == "t.me"
-        or host.endswith(".t.me")
-        or host == "telegram.me"
-        or host.endswith(".telegram.me")
-    ):
+    if host == "t.me" or host.endswith(".t.me"):
         return False
 
     return True
 
 
-def failure_text(kind):
-    ending = random.choice(
-        (
-            "شم كسي يلا",
-            "شم طيزي يلا"
-        )
-    )
+def yt_options(outtmpl=None):
+    options = {
+        "quiet": True,
+        "no_warnings": False,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "continuedl": False,
+        "overwrites": True,
+        "js_runtimes": {
+            "deno": {}
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/139.0.0.0 "
+                "Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9"
+        }
+    }
 
-    if kind == "youtube":
-        return (
-            "اليوت غير مدعوم او العنوان غير متوفر\n"
-            f"{ending}"
-        )
+    if outtmpl:
+        options["outtmpl"] = str(outtmpl)
 
-    return (
-        "الرابط غير مدعوم او الرابط غير مدعوم\n"
-        f"{ending}"
-    )
+    return options
 
 
 async def cleanup(folder):
@@ -190,13 +203,15 @@ async def cleanup(folder):
             return
 
         for item in folder.iterdir():
-            try:
-                if item.is_file() or item.is_symlink():
+
+            if item.is_file() or item.is_symlink():
+                try:
                     item.unlink()
-                elif item.is_dir():
-                    await cleanup(item)
-            except Exception:
-                pass
+                except Exception:
+                    pass
+
+            elif item.is_dir():
+                await cleanup(item)
 
         try:
             folder.rmdir()
@@ -208,16 +223,12 @@ async def cleanup(folder):
 
 
 async def youtube_search(query):
-    if not query or len(query) > MAX_QUERY_LENGTH:
+    if not query or len(query) > 300:
         raise RuntimeError()
 
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "noplaylist": True,
-        "socket_timeout": 20
-    }
+    options = yt_options()
+
+    options["extract_flat"] = True
 
     def search():
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -225,6 +236,9 @@ async def youtube_search(query):
                 f"ytsearch1:{query}",
                 download=False
             )
+
+        if not result:
+            raise RuntimeError()
 
         entries = result.get("entries") or []
 
@@ -235,7 +249,7 @@ async def youtube_search(query):
 
         url = (
             entry.get("webpage_url")
-            or entry.get("url")
+            or entry.get("original_url")
         )
 
         if not url:
@@ -248,19 +262,17 @@ async def youtube_search(query):
 
 async def download_voice(url, folder):
     source = folder / "source.%(ext)s"
-    output = folder / "voice.ogg"
 
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": str(source),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 20,
-        "max_filesize": MAX_DOWNLOAD_SIZE,
-        "continuedl": False,
-        "overwrites": True
-    }
+    options = yt_options(source)
+
+    options.update({
+        "format": (
+            "bestaudio[ext=m4a]/"
+            "bestaudio[ext=webm]/"
+            "bestaudio/best"
+        ),
+        "max_filesize": MAX_DOWNLOAD_SIZE
+    })
 
     def download():
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -269,23 +281,25 @@ async def download_voice(url, folder):
                 download=True
             )
 
-            return Path(
-                ydl.prepare_filename(info)
-            )
+            filename = ydl.prepare_filename(info)
 
-    source_file = await asyncio.to_thread(
-        download
-    )
+            return Path(filename)
+
+    source_file = await asyncio.to_thread(download)
 
     if not source_file.exists():
+
         candidates = [
-            x for x in folder.iterdir()
-            if x.is_file()
-            and x.suffix.lower()
-            not in {
-                ".part",
-                ".ytdl"
-            }
+            x
+            for x in folder.iterdir()
+            if (
+                x.is_file()
+                and x.suffix.lower()
+                not in {
+                    ".part",
+                    ".ytdl"
+                }
+            )
         ]
 
         if not candidates:
@@ -295,6 +309,8 @@ async def download_voice(url, folder):
 
     if source_file.stat().st_size > MAX_DOWNLOAD_SIZE:
         raise RuntimeError()
+
+    output = folder / "voice.ogg"
 
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
@@ -335,10 +351,8 @@ async def download_voice(url, folder):
 async def process_download(item):
     chat_id = item["chat_id"]
     url = item["url"]
-    query = item["query"]
     source_type = item["type"]
-    status = item["status"]
-    source_message = item["source_message"]
+    original_message = item["original_message"]
 
     folder = Path(
         tempfile.mkdtemp(
@@ -352,69 +366,48 @@ async def process_download(item):
             folder
         )
 
-        try:
-            await status.delete()
-        except Exception:
-            pass
-
-        sent = await bot.send_voice(
+        await bot.send_voice(
             chat_id=chat_id,
             voice=FSInputFile(output),
+            reply_markup=owner_keyboard(),
             reply_parameters=reply_parameters(
-                source_message
-            ),
-            reply_markup=owner_keyboard()
+                original_message
+            )
         )
-
-        file_id = None
-
-        if sent.voice:
-            file_id = sent.voice.file_id
 
         async with state_lock:
             key = str(chat_id)
 
-            if key not in settings:
-                settings[key] = {}
+            settings.setdefault(
+                key,
+                {}
+            )
 
-            downloads = settings[key].setdefault(
+            settings[key].setdefault(
                 "downloads",
                 {}
             )
 
             id_file = new_id()
 
-            downloads[id_file] = {
+            settings[key]["downloads"][id_file] = {
                 "id_file": id_file,
                 "type": source_type,
-                "query": query,
-                "url": url,
-                "telegram_file_id": file_id
+                "url": url
             }
 
             save_data()
 
     except Exception:
         try:
-            await status.edit_text(
-                failure_text(
-                    source_type
-                ),
-                reply_markup=None
+            await original_message.answer(
+                failure_text(source_type),
+                reply_parameters=reply_parameters(
+                    original_message
+                )
             )
         except Exception:
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=failure_text(
-                        source_type
-                    ),
-                    reply_parameters=reply_parameters(
-                        source_message
-                    )
-                )
-            except Exception:
-                pass
+            pass
 
     finally:
         await cleanup(folder)
@@ -439,24 +432,15 @@ async def worker(chat_id):
                 item = queue.pop(0)
 
                 running[chat_id] = (
-                    running.get(
-                        chat_id,
-                        0
-                    ) + 1
+                    running.get(chat_id, 0) + 1
                 )
 
             try:
-                await process_download(
-                    item
-                )
-
+                await process_download(item)
             finally:
                 async with state_lock:
                     current = (
-                        running.get(
-                            chat_id,
-                            0
-                        ) - 1
+                        running.get(chat_id, 0) - 1
                     )
 
                     if current <= 0:
@@ -491,10 +475,8 @@ async def start_worker(chat_id):
 async def add_download(
     chat_id,
     url,
-    query,
     source_type,
-    status,
-    source_message
+    original_message
 ):
     async with state_lock:
         active = running.get(
@@ -509,35 +491,213 @@ async def add_download(
             )
         )
 
-        if active >= 3 and queued >= 3:
-            return False
-
         if active + queued >= 6:
             return False
 
         queues.setdefault(
             chat_id,
             []
-        ).append(
-            {
-                "chat_id": chat_id,
-                "url": url,
-                "query": query,
-                "type": source_type,
-                "status": status,
-                "source_message": source_message
-            }
-        )
+        ).append({
+            "chat_id": chat_id,
+            "url": url,
+            "type": source_type,
+            "original_message": original_message
+        })
 
-        await start_worker(
-            chat_id
-        )
+        await start_worker(chat_id)
 
         return True
 
 
-async def process_text_message(message):
-    if not is_allowed_chat(message):
+async def handle_download(
+    message,
+    url,
+    source_type
+):
+    try:
+        status = await message.answer(
+            "بدأت بالعثور ع طلبك امهلني\n"
+            "قليلا فضلا وليس امرا",
+            reply_parameters=reply_parameters(
+                message
+            )
+        )
+
+        accepted = await add_download(
+            message.chat.id,
+            url,
+            source_type,
+            message
+        )
+
+        if not accepted:
+            await status.edit_text(
+                failure_text(source_type)
+            )
+
+    except Exception:
+        try:
+            await message.answer(
+                failure_text(source_type),
+                reply_parameters=reply_parameters(
+                    message
+                )
+            )
+        except Exception:
+            pass
+
+
+async def handle_youtube(
+    message,
+    query
+):
+    enabled = settings.get(
+        "_global",
+        {}
+    ).get(
+        "youtube",
+        True
+    )
+
+    if not enabled:
+        return
+
+    try:
+        status = await message.answer(
+            f"¹# - بدأت بالعثور ع {query} امهلني\n"
+            "قليلا فضلا وليس امرا",
+            reply_parameters=reply_parameters(
+                message
+            )
+        )
+
+        url = await youtube_search(query)
+
+        accepted = await add_download(
+            message.chat.id,
+            url,
+            "youtube",
+            message
+        )
+
+        if not accepted:
+            await status.edit_text(
+                failure_text("youtube")
+            )
+
+    except Exception:
+        try:
+            await message.answer(
+                failure_text("youtube"),
+                reply_parameters=reply_parameters(
+                    message
+                )
+            )
+        except Exception:
+            pass
+
+
+@router.message(Command("تعطيل_اليوت"))
+@router.message(F.text == "تعطيل اليوت")
+async def disable_youtube(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    settings.setdefault(
+        "_global",
+        {}
+    )
+
+    current = settings["_global"].get(
+        "youtube",
+        True
+    )
+
+    if current is False:
+        text = (
+            "تم تعطيل اليوت\n"
+            "بالفعل"
+        )
+    else:
+        settings["_global"]["youtube"] = False
+        save_data()
+
+        text = (
+            "تم تعطيل اليوت\n"
+            "مولاي"
+        )
+
+    await message.answer(
+        text,
+        reply_parameters=reply_parameters(
+            message
+        )
+    )
+
+
+@router.message(Command("تفعيل_اليوت"))
+@router.message(F.text == "تفعيل اليوت")
+async def enable_youtube(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    settings.setdefault(
+        "_global",
+        {}
+    )
+
+    current = settings["_global"].get(
+        "youtube",
+        True
+    )
+
+    if current is True:
+        text = (
+            "تم تفعيل اليوت\n"
+            "بالفعل"
+        )
+    else:
+        settings["_global"]["youtube"] = True
+        save_data()
+
+        text = (
+            "تم تفعيل اليوت\n"
+            "مولاي"
+        )
+
+    await message.answer(
+        text,
+        reply_parameters=reply_parameters(
+            message
+        )
+    )
+
+
+@router.message()
+async def group_handler(message: Message):
+    if message.chat.type == ChatType.PRIVATE:
+        return
+
+    if message.chat.type != ChatType.GROUP and \
+       message.chat.type != ChatType.SUPERGROUP:
         return
 
     if not message.text:
@@ -551,37 +711,91 @@ async def process_text_message(message):
         if not query:
             return
 
+        await handle_youtube(
+            message,
+            query
+        )
+
+        return
+
+    if text.startswith(
+        (
+            "http://",
+            "https://"
+        )
+    ):
+        if not valid_download_url(text):
+            await message.answer(
+                failure_text("url"),
+                reply_parameters=reply_parameters(
+                    message
+                )
+            )
+            return
+
+        await handle_download(
+            message,
+            text,
+            "url"
+        )
+
+
+@router.channel_post()
+async def channel_handler(message: Message):
+    if message.chat.type != ChatType.CHANNEL:
+        return
+
+    if not message.text:
+        return
+
+    text = message.text.strip()
+
+    if text.startswith("يوت"):
+        query = text[3:].strip()
+
+        if not query:
+            return
+
+        enabled = settings.get(
+            "_global",
+            {}
+        ).get(
+            "youtube",
+            True
+        )
+
+        if not enabled:
+            return
+
         try:
-            status = await message.reply(
+            status = await message.answer(
                 f"¹# - بدأت بالعثور ع {query} امهلني\n"
-                "قليلا فضلا وليس امرا"
+                "قليلا فضلا وليس امرا",
+                reply_parameters=reply_parameters(
+                    message
+                )
             )
 
-            url = await youtube_search(
-                query
-            )
+            url = await youtube_search(query)
 
             accepted = await add_download(
                 message.chat.id,
                 url,
-                query,
                 "youtube",
-                status,
                 message
             )
 
             if not accepted:
                 await status.edit_text(
-                    failure_text(
-                        "youtube"
-                    )
+                    failure_text("youtube")
                 )
 
         except Exception:
             try:
-                await message.reply(
-                    failure_text(
-                        "youtube"
+                await message.answer(
+                    failure_text("youtube"),
+                    reply_parameters=reply_parameters(
+                        message
                     )
                 )
             except Exception:
@@ -595,170 +809,20 @@ async def process_text_message(message):
             "https://"
         )
     ):
-        url = text
-
-        if not valid_download_url(url):
-            await message.reply(
-                failure_text(
-                    "url"
+        if not valid_download_url(text):
+            await message.answer(
+                failure_text("url"),
+                reply_parameters=reply_parameters(
+                    message
                 )
             )
             return
 
-        try:
-            status = await message.reply(
-                "بدأت بالعثور ع طلبك امهلني\n"
-                "قليلا فضلا وليس امرا"
-            )
-
-            accepted = await add_download(
-                message.chat.id,
-                url,
-                url,
-                "url",
-                status,
-                message
-            )
-
-            if not accepted:
-                await status.edit_text(
-                    failure_text(
-                        "url"
-                    )
-                )
-
-        except Exception:
-            try:
-                await message.reply(
-                    failure_text(
-                        "url"
-                    )
-                )
-            except Exception:
-                pass
-
-
-@router.message(Command("ادت"))
-@router.message(F.text == "ادت")
-async def edit_command(message: Message):
-    if not is_allowed_chat(message):
-        return
-
-    if not message.from_user:
-        return
-
-    if not is_admin(
-        message.from_user.id
-    ):
-        return
-
-    await message.reply(
-        "الأوامر متاحة للمطور فقط"
-    )
-
-
-@router.message(Command("تعطيل_اليوت"))
-@router.message(F.text == "تعطيل اليوت")
-async def disable_youtube(message: Message):
-    if not is_allowed_chat(message):
-        return
-
-    if not message.from_user:
-        return
-
-    if not is_admin(
-        message.from_user.id
-    ):
-        return
-
-    global settings
-
-    global_data = settings.setdefault(
-        "_global",
-        {}
-    )
-
-    if global_data.get(
-        "private_youtube",
-        True
-    ) is False:
-        await message.reply(
-            "تم تعطيل اليوت\n"
-            "بالفعل"
+        await handle_download(
+            message,
+            text,
+            "url"
         )
-        return
-
-    global_data[
-        "private_youtube"
-    ] = False
-
-    save_data()
-
-    await message.reply(
-        "تم تعطيل اليوت\n"
-        "مولاي"
-    )
-
-
-@router.message(Command("تفعيل_اليوت"))
-@router.message(F.text == "تفعيل اليوت")
-async def enable_youtube(message: Message):
-    if not is_allowed_chat(message):
-        return
-
-    if not message.from_user:
-        return
-
-    if not is_admin(
-        message.from_user.id
-    ):
-        return
-
-    global_data = settings.setdefault(
-        "_global",
-        {}
-    )
-
-    global_data[
-        "private_youtube"
-    ] = True
-
-    save_data()
-
-    await message.reply(
-        "تم تفعيل اليوت"
-    )
-
-
-@router.message()
-async def message_handler(message: Message):
-    if not is_allowed_chat(message):
-        return
-
-    if message.from_user:
-        user_id = message.from_user.id
-
-        task = waiting.get(user_id)
-
-        if task:
-            waiting.pop(
-                user_id,
-                None
-            )
-
-    await process_text_message(
-        message
-    )
-
-
-@router.channel_post()
-async def channel_handler(message: Message):
-    if message.chat.type != ChatType.CHANNEL:
-        return
-
-    await process_text_message(
-        message
-    )
 
 
 async def startup_message():
@@ -774,17 +838,19 @@ async def startup_message():
 
 
 async def main():
-    global bot_add_link
-
     load_data()
 
-    me = await bot.get_me()
+    settings.setdefault(
+        "_global",
+        {}
+    )
 
-    if me.username:
-        bot_add_link = (
-            f"https://t.me/{me.username}"
-            "?startgroup=true"
-        )
+    settings["_global"].setdefault(
+        "youtube",
+        True
+    )
+
+    save_data()
 
     await startup_message()
 
