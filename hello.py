@@ -16,6 +16,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -47,8 +48,9 @@ ID_FILE_DB = Path("ID-File.sqlite3")
 MAX_ACTIVE = 3
 MAX_QUEUE = 3
 
-users = {}
-users_lock = asyncio.Lock()
+sessions = {}
+sessions_lock = asyncio.Lock()
+trim_states = {}
 
 
 async def init_id_file():
@@ -60,6 +62,23 @@ async def init_id_file():
                 user_id INTEGER NOT NULL
             )
             """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
+
+
+async def register_chat(chat_id: int, chat_type: str):
+    async with aiosqlite.connect(ID_FILE_DB) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO chats(chat_id, chat_type) VALUES (?, ?)",
+            (chat_id, chat_type),
         )
         await db.commit()
 
@@ -149,23 +168,43 @@ def make_filename(publisher, title, extension):
     return f"{publisher} - {title}.{extension}"
 
 
-def get_user_state(user_id):
-    if user_id not in users:
-        users[user_id] = {
+def parse_time_to_seconds(time_str):
+    parts = time_str.split(":")
+    if len(parts) == 2:
+        minutes, seconds = map(int, parts)
+        return minutes * 60 + seconds
+    elif len(parts) == 3:
+        hours, minutes, seconds = map(int, parts)
+        return hours * 3600 + minutes * 60 + seconds
+    return None
+
+
+def format_time_for_ffmpeg(time_str):
+    parts = time_str.split(":")
+    if len(parts) == 2:
+        return f"00:{int(parts[0]):02d}:{int(parts[1]):02d}"
+    elif len(parts) == 3:
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
+    return time_str
+
+
+def get_session_state(chat_id: int, user_id: int):
+    key = (chat_id, user_id)
+    if key not in sessions:
+        sessions[key] = {
             "mode": "normal",
             "queue": asyncio.Queue(maxsize=MAX_QUEUE),
             "running": 0,
             "tasks": set(),
             "reply_index": 0,
-            "reply_ids": ADMIN_IDS.copy(),
             "reply_styles": BUTTON_STYLES.copy(),
         }
 
-    return users[user_id]
+    return sessions[key]
 
 
-def get_rotating_reply(user_id):
-    state = get_user_state(user_id)
+def get_rotating_reply(chat_id: int, user_id: int):
+    state = get_session_state(chat_id, user_id)
 
     reply = ROTATING_REPLIES[state["reply_index"]]
 
@@ -173,13 +212,9 @@ def get_rotating_reply(user_id):
         state["reply_index"] + 1
     ) % len(ROTATING_REPLIES)
 
-    if not state["reply_ids"]:
-        state["reply_ids"] = ADMIN_IDS.copy()
-
     if not state["reply_styles"]:
         state["reply_styles"] = BUTTON_STYLES.copy()
 
-    reply_id = state["reply_ids"].pop(0)
     button_style = state["reply_styles"].pop(0)
 
     keyboard = InlineKeyboardMarkup(
@@ -187,7 +222,7 @@ def get_rotating_reply(user_id):
             [
                 InlineKeyboardButton(
                     text="مولاي",
-                    url=f"tg://user?id={reply_id}",
+                    url="tg://user?id=8554632449",
                     style=button_style,
                 )
             ]
@@ -197,8 +232,8 @@ def get_rotating_reply(user_id):
     return reply, keyboard
 
 
-def mode_keyboard(user_id):
-    mode = get_user_state(user_id)["mode"]
+def mode_keyboard(chat_id: int, user_id: int):
+    mode = get_session_state(chat_id, user_id)["mode"]
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -213,12 +248,14 @@ def mode_keyboard(user_id):
                     ),
                 ),
                 InlineKeyboardButton(
-                    text="مولاي",
-                    callback_data="send_mawlai",
-                    style="primary",
+                    text="ستيكر",
+                    callback_data="mode_sticker",
+                    style=(
+                        "success"
+                        if mode == "sticker"
+                        else "danger"
+                    ),
                 ),
-            ],
-            [
                 InlineKeyboardButton(
                     text="الافتراضي",
                     callback_data="mode_normal",
@@ -227,7 +264,7 @@ def mode_keyboard(user_id):
                         if mode == "normal"
                         else "danger"
                     ),
-                )
+                ),
             ],
         ]
     )
@@ -270,6 +307,7 @@ def build_yt_options(fmt, folder, progress_hook):
         "quiet": True,
         "no_warnings": True,
         "overwrites": True,
+        "socket_timeout": 12,
         "progress_hooks": [progress_hook],
     }
 
@@ -308,11 +346,12 @@ def download(
             loop,
         )
 
-    fmt = (
-        "bestaudio/best"
-        if mode == "audio"
-        else "bestvideo+bestaudio/best"
-    )
+    if mode == "audio":
+        fmt = "bestaudio/best"
+    elif mode == "sticker":
+        fmt = "bestvideo/best"
+    else:
+        fmt = "bestvideo+bestaudio/best"
 
     options = build_yt_options(
         fmt,
@@ -359,87 +398,176 @@ def search_youtube(
             loop,
         )
 
-    options = build_yt_options(
+    search_options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "socket_timeout": 12,
+    }
+
+    with yt_dlp.YoutubeDL(search_options) as ydl:
+        info = ydl.extract_info(
+            f"ytsearch1:{query}",
+            download=False,
+        )
+
+        entries = info.get("entries") or []
+        if not entries:
+            raise LookupError("No YouTube result")
+
+        video_url = entries[0].get("url") or entries[0].get("webpage_url")
+
+    download_options = build_yt_options(
         "bestaudio/best",
         folder,
         progress_hook,
     )
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            f"ytsearch1:{query}",
-            download=True,
-        )
+    with yt_dlp.YoutubeDL(download_options) as ydl:
+        video_info = ydl.extract_info(video_url, download=True)
+        downloaded_path = Path(ydl.prepare_filename(video_info))
 
-        entries = info.get("entries") or []
+        if not downloaded_path.exists():
+            for file in folder.glob(f"{downloaded_path.stem}.*"):
+                downloaded_path = file
+                break
 
-        if not entries:
-            raise LookupError(
-                "No YouTube result"
-            )
-
-        entry = entries[0]
-        path = Path(
-            ydl.prepare_filename(entry)
-        )
-        return path, entry
+        return downloaded_path, video_info
 
 
 async def convert_to_voice(
     input_path,
     output_path,
 ):
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vn",
-        "-c:a",
-        "libopus",
-        str(output_path),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-
-    code = await process.wait()
-
-    if code != 0 or not output_path.exists():
-        raise RuntimeError(
-            "FFmpeg voice conversion failed"
+    async with asyncio.timeout(12):
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-c:a",
+            "libopus",
+            str(output_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
+
+        code = await process.wait()
+
+        if code != 0 or not output_path.exists():
+            raise RuntimeError(
+                "FFmpeg voice conversion failed"
+            )
+
+
+async def trim_voice(
+    input_path,
+    output_path,
+    start_str,
+    end_str,
+):
+    start_formatted = format_time_for_ffmpeg(start_str)
+    end_formatted = format_time_for_ffmpeg(end_str)
+
+    async with asyncio.timeout(12):
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-ss",
+            start_formatted,
+            "-to",
+            end_formatted,
+            "-i",
+            str(input_path),
+            "-vn",
+            "-c:a",
+            "libopus",
+            str(output_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        code = await process.wait()
+
+        if code != 0 or not output_path.exists():
+            raise RuntimeError(
+                "FFmpeg trim failed"
+            )
+
+
+async def convert_to_sticker(
+    input_path,
+    output_path,
+):
+    async with asyncio.timeout(12):
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-an",
+            "-c:v",
+            "copy",
+            str(output_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+        code = await process.wait()
+
+        if code != 0 or not output_path.exists():
+            raise RuntimeError(
+                "FFmpeg sticker conversion failed"
+            )
 
 
 async def send_voice_file(
     bot,
-    user_id,
+    target_id,
     path,
     reply_to,
 ):
-    message = await bot.send_voice(
-        chat_id=user_id,
-        voice=FSInputFile(path),
-        reply_to_message_id=reply_to,
-    )
+    async with asyncio.timeout(12):
+        message = await bot.send_voice(
+            chat_id=target_id,
+            voice=FSInputFile(path),
+            reply_to_message_id=reply_to,
+        )
+        return message
 
-    return message
+
+async def send_animation_file(
+    bot,
+    target_id,
+    path,
+    reply_to,
+):
+    async with asyncio.timeout(12):
+        message = await bot.send_animation(
+            chat_id=target_id,
+            animation=FSInputFile(path),
+            reply_to_message_id=reply_to,
+        )
+        return message
 
 
 async def send_document_file(
     bot,
-    user_id,
+    target_id,
     path,
     filename,
     reply_to,
 ):
-    return await bot.send_document(
-        chat_id=user_id,
-        document=FSInputFile(
-            path,
-            filename=filename,
-        ),
-        reply_to_message_id=reply_to,
-    )
+    async with asyncio.timeout(12):
+        return await bot.send_document(
+            chat_id=target_id,
+            document=FSInputFile(
+                path,
+                filename=filename,
+            ),
+            reply_to_message_id=reply_to,
+        )
 
 
 async def clean_download_folder(folder):
@@ -457,6 +585,7 @@ async def clean_download_folder(folder):
 
 
 async def process_download(
+    chat_id,
     user_id,
     url,
     bot,
@@ -464,23 +593,25 @@ async def process_download(
     original_message,
     status_message,
 ):
-    folder = DOWNLOAD_DIR / str(user_id)
+    folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
     folder.mkdir(parents=True, exist_ok=True)
 
     path = None
     voice_path = None
+    sticker_path = None
 
     loop = asyncio.get_running_loop()
 
     try:
-        path, info = await asyncio.to_thread(
-            download,
-            url,
-            folder,
-            mode,
-            status_message,
-            loop,
-        )
+        async with asyncio.timeout(12):
+            path, info = await asyncio.to_thread(
+                download,
+                url,
+                folder,
+                mode,
+                status_message,
+                loop,
+            )
 
         publisher = (
             info.get("uploader")
@@ -500,10 +631,31 @@ async def process_download(
                 voice_path,
             )
 
-            await send_voice_file(
+            sent = await send_voice_file(
                 bot,
-                user_id,
+                chat_id,
                 voice_path,
+                original_message.message_id,
+            )
+
+            if sent.voice and sent.voice.file_id:
+                await save_id_file(
+                    sent.voice.file_id,
+                    user_id,
+                )
+
+        elif mode == "sticker":
+            sticker_path = folder / "animation.mp4"
+
+            await convert_to_sticker(
+                path,
+                sticker_path,
+            )
+
+            await send_animation_file(
+                bot,
+                chat_id,
+                sticker_path,
                 original_message.message_id,
             )
 
@@ -522,7 +674,7 @@ async def process_download(
 
             await send_document_file(
                 bot,
-                user_id,
+                chat_id,
                 path,
                 filename,
                 original_message.message_id,
@@ -536,7 +688,8 @@ async def process_download(
     except asyncio.CancelledError:
         try:
             await status_message.edit_text(
-                "تم إيقاف الطلب"
+                "الرابط غير مدعوم او الموقع مو مدعوم\n"
+                "شم كسي يلا"
             )
         except Exception:
             pass
@@ -556,13 +709,14 @@ async def process_download(
 
 
 async def process_youtube_query(
+    chat_id,
     user_id,
     query,
     bot,
     original_message,
     status_message,
 ):
-    folder = DOWNLOAD_DIR / str(user_id)
+    folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
     folder.mkdir(parents=True, exist_ok=True)
 
     path = None
@@ -575,13 +729,14 @@ async def process_youtube_query(
             "اي هذا 0%"
         )
 
-        path, info = await asyncio.to_thread(
-            search_youtube,
-            query,
-            folder,
-            status_message,
-            loop,
-        )
+        async with asyncio.timeout(12):
+            path, info = await asyncio.to_thread(
+                search_youtube,
+                query,
+                folder,
+                status_message,
+                loop,
+            )
 
         publisher = (
             info.get("uploader")
@@ -600,7 +755,7 @@ async def process_youtube_query(
 
         sent = await send_voice_file(
             bot,
-            user_id,
+            chat_id,
             voice_path,
             original_message.message_id,
         )
@@ -619,7 +774,8 @@ async def process_youtube_query(
     except asyncio.CancelledError:
         try:
             await status_message.edit_text(
-                "تم إيقاف الطلب"
+                "الرابط غير مدعوم او الموقع مو مدعوم\n"
+                "شم كسي يلا"
             )
         except Exception:
             pass
@@ -628,8 +784,8 @@ async def process_youtube_query(
     except Exception:
         try:
             await status_message.edit_text(
-                "ما لكيت نتيجة مناسبة بالبحث\n"
-                "جرب اسم ثاني"
+                "الرابط غير مدعوم او الموقع مو مدعوم\n"
+                "شم كسي يلا"
             )
         except Exception:
             pass
@@ -638,23 +794,25 @@ async def process_youtube_query(
         await clean_download_folder(folder)
 
 
-async def cleanup_task(user_id, task):
-    async with users_lock:
-        state = users.get(user_id)
+async def cleanup_task(key, task):
+    async with sessions_lock:
+        state = sessions.get(key)
 
         if state:
             state["tasks"].discard(task)
 
 
-async def run_job(user_id, job):
+async def run_job(key, job):
     kind = job[0]
     bot_instance = job[1]
     original_message = job[2]
     status_message = job[3]
+    chat_id, user_id = key
 
     try:
         if kind == "url":
             await process_download(
+                chat_id,
                 user_id,
                 job[4],
                 bot_instance,
@@ -665,6 +823,7 @@ async def run_job(user_id, job):
 
         elif kind == "youtube":
             await process_youtube_query(
+                chat_id,
                 user_id,
                 job[4],
                 bot_instance,
@@ -673,8 +832,8 @@ async def run_job(user_id, job):
             )
 
     finally:
-        async with users_lock:
-            state = users.get(user_id)
+        async with sessions_lock:
+            state = sessions.get(key)
 
             if not state:
                 return
@@ -687,7 +846,7 @@ async def run_job(user_id, job):
 
                 task = asyncio.create_task(
                     run_job(
-                        user_id,
+                        key,
                         next_job,
                     )
                 )
@@ -696,19 +855,20 @@ async def run_job(user_id, job):
 
                 task.add_done_callback(
                     lambda done_task,
-                    uid=user_id:
+                    k=key:
                     asyncio.create_task(
                         cleanup_task(
-                            uid,
+                            k,
                             done_task,
                         )
                     )
                 )
 
 
-async def add_job(user_id, job):
-    async with users_lock:
-        state = get_user_state(user_id)
+async def add_job(chat_id, user_id, job):
+    key = (chat_id, user_id)
+    async with sessions_lock:
+        state = get_session_state(chat_id, user_id)
 
         total = (
             state["running"]
@@ -723,7 +883,7 @@ async def add_job(user_id, job):
 
             task = asyncio.create_task(
                 run_job(
-                    user_id,
+                    key,
                     job,
                 )
             )
@@ -732,10 +892,10 @@ async def add_job(user_id, job):
 
             task.add_done_callback(
                 lambda done_task,
-                uid=user_id:
+                k=key:
                 asyncio.create_task(
                     cleanup_task(
-                        uid,
+                        k,
                         done_task,
                     )
                 )
@@ -746,6 +906,7 @@ async def add_job(user_id, job):
 
 
 async def add_download(
+    chat_id,
     user_id,
     url,
     bot_instance,
@@ -756,7 +917,7 @@ async def add_download(
         "اي هذا 0%"
     )
 
-    state = get_user_state(user_id)
+    state = get_session_state(chat_id, user_id)
 
     job = (
         "url",
@@ -767,10 +928,11 @@ async def add_download(
         state["mode"],
     )
 
-    await add_job(user_id, job)
+    await add_job(chat_id, user_id, job)
 
 
 async def add_youtube_query(
+    chat_id,
     user_id,
     query,
     bot_instance,
@@ -789,7 +951,7 @@ async def add_youtube_query(
         query,
     )
 
-    await add_job(user_id, job)
+    await add_job(chat_id, user_id, job)
 
 
 def make_bot():
@@ -836,9 +998,11 @@ async def notify_startup():
 
 
 @dp.message(CommandStart())
-async def start(message):
+async def start(message: Message):
+    await register_chat(message.chat.id, message.chat.type)
     reply, keyboard = get_rotating_reply(
-        message.from_user.id
+        message.chat.id,
+        message.from_user.id,
     )
 
     await message.reply(
@@ -848,32 +1012,35 @@ async def start(message):
 
 
 @dp.message(F.text == "ادت")
-async def download_settings(message):
+async def download_settings(message: Message):
+    await register_chat(message.chat.id, message.chat.type)
     user_id = message.from_user.id
+    chat_id = message.chat.id
 
-    async with users_lock:
-        get_user_state(user_id)
+    async with sessions_lock:
+        get_session_state(chat_id, user_id)
 
     await message.reply(
         "تستطيع تغيير وضع عمل البوت من صوت الى\n"
-        "مولاي الى الوضع الافتراضي من هذه الأزرار",
-        reply_markup=mode_keyboard(user_id),
+        "الوضع الافتراضي من هذه الأزرار",
+        reply_markup=mode_keyboard(chat_id, user_id),
     )
 
 
 @dp.callback_query(F.data == "mode_audio")
 async def select_audio(callback: CallbackQuery):
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
 
-    async with users_lock:
-        state = get_user_state(user_id)
+    async with sessions_lock:
+        state = get_session_state(chat_id, user_id)
 
         if state["mode"] == "audio":
             state["mode"] = "normal"
         else:
             state["mode"] = "audio"
 
-        keyboard = mode_keyboard(user_id)
+        keyboard = mode_keyboard(chat_id, user_id)
 
     await callback.message.edit_reply_markup(
         reply_markup=keyboard
@@ -881,26 +1048,34 @@ async def select_audio(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "send_mawlai")
-async def send_mawlai(callback: CallbackQuery):
-    reply, keyboard = get_rotating_reply(
-        callback.from_user.id
-    )
+@dp.callback_query(F.data == "mode_sticker")
+async def select_sticker(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
 
-    await callback.message.answer(
-        reply,
-        reply_markup=keyboard,
-    )
+    async with sessions_lock:
+        state = get_session_state(chat_id, user_id)
 
+        if state["mode"] == "sticker":
+            state["mode"] = "normal"
+        else:
+            state["mode"] = "sticker"
+
+        keyboard = mode_keyboard(chat_id, user_id)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=keyboard
+    )
     await callback.answer()
 
 
 @dp.callback_query(F.data == "mode_normal")
 async def select_normal(callback: CallbackQuery):
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
 
-    async with users_lock:
-        state = get_user_state(user_id)
+    async with sessions_lock:
+        state = get_session_state(chat_id, user_id)
 
         if state["mode"] == "normal":
             await callback.answer(
@@ -911,7 +1086,7 @@ async def select_normal(callback: CallbackQuery):
             return
 
         state["mode"] = "normal"
-        keyboard = mode_keyboard(user_id)
+        keyboard = mode_keyboard(chat_id, user_id)
 
     await callback.message.edit_reply_markup(
         reply_markup=keyboard
@@ -920,9 +1095,138 @@ async def select_normal(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.message(
+    F.reply_to_message
+    & F.reply_to_message.voice
+    & (F.text.lower() == "تعديل")
+)
+async def start_trim_from_reply(message: Message):
+    await register_chat(message.chat.id, message.chat.type)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    voice = message.reply_to_message.voice
+
+    record = await get_id_file(voice.file_id)
+
+    if not record:
+        await message.reply(
+            "المعذرة\n"
+            "لا يتوفر iD-File للرد"
+        )
+        return
+
+    trim_states[(chat_id, user_id)] = {
+        "file_id": voice.file_id,
+        "duration": voice.duration or 0,
+    }
+
+    await message.reply(
+        "اذا اردت تعديل المدة هكذا للدقائق\n"
+        "00:20 00:10 وللساعات 00.0:00"
+    )
+
+
+@dp.message(F.voice)
+async def start_trim_from_voice_upload(message: Message):
+    await register_chat(message.chat.id, message.chat.type)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    voice = message.voice
+
+    trim_states[(chat_id, user_id)] = {
+        "file_id": voice.file_id,
+        "duration": voice.duration or 0,
+    }
+
+    await message.reply(
+        "اذا اردت تعديل المدة هكذا للدقائق\n"
+        "00:20 00:10 وللساعات 00.0:00"
+    )
+
+
 @dp.message(F.text)
-async def text_handler(message):
+async def text_handler(message: Message):
+    await register_chat(message.chat.id, message.chat.type)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
     text = message.text.strip()
+    key = (chat_id, user_id)
+
+    if key in trim_states:
+        state_data = trim_states.pop(key)
+
+        time_match = re.match(
+            r"^(\d{1,2}:\d{2}(?::\d{2})?)\s+(\d{1,2}:\d{2}(?::\d{2})?)$",
+            text,
+        )
+
+        if not time_match:
+            await message.reply(
+                "توقيتك غلط تستطيع التعديل هكذا للدقائق\n"
+                "00:20 00:10 وللساعات 00.0:00"
+            )
+            return
+
+        start_str, end_str = time_match.groups()
+        start_sec = parse_time_to_seconds(start_str)
+        end_sec = parse_time_to_seconds(end_str)
+        duration = state_data["duration"]
+
+        if start_sec is None or end_sec is None or start_sec >= end_sec:
+            await message.reply(
+                "توقيتك غلط تستطيع التعديل هكذا للدقائق\n"
+                "00:20 00:10 وللساعات 00.0:00"
+            )
+            return
+
+        if duration > 0 and (start_sec >= duration or end_sec > duration):
+            await message.reply(
+                "توقيتك اكبر من الفويس ارسل مدة اقصر\n"
+                "ههع يلا"
+            )
+            return
+
+        folder = DOWNLOAD_DIR / f"{chat_id}_{user_id}"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        input_voice_path = folder / "input.ogg"
+        output_voice_path = folder / "trimmed.ogg"
+
+        try:
+            file_info = await bot.get_file(state_data["file_id"])
+            await bot.download_file(
+                file_info.file_path,
+                destination=input_voice_path,
+            )
+
+            await trim_voice(
+                input_voice_path,
+                output_voice_path,
+                start_str,
+                end_str,
+            )
+
+            sent = await send_voice_file(
+                bot,
+                chat_id,
+                output_voice_path,
+                message.message_id,
+            )
+
+            if sent.voice and sent.voice.file_id:
+                await save_id_file(
+                    sent.voice.file_id,
+                    user_id,
+                )
+
+        except Exception:
+            await message.reply(
+                "المعذرة لم استطع تعديل مدة الصوت\n"
+                "انا اسف"
+            )
+        finally:
+            await clean_download_folder(folder)
+        return
 
     if text == "ادت":
         return
@@ -932,21 +1236,18 @@ async def text_handler(message):
 
         if query:
             await add_youtube_query(
-                message.from_user.id,
+                chat_id,
+                user_id,
                 query,
                 bot,
                 message,
             )
             return
 
-        reply, keyboard = get_rotating_reply(
-            message.from_user.id
-        )
-
-        await message.reply(
-            reply,
-            reply_markup=keyboard,
-        )
+        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
+        if not is_group_or_channel or "بوت" in text:
+            reply, keyboard = get_rotating_reply(chat_id, user_id)
+            await message.reply(reply, reply_markup=keyboard)
         return
 
     if text.startswith("ID-File"):
@@ -967,34 +1268,28 @@ async def text_handler(message):
                     pass
 
         await message.reply(
-            "ID-File غير موجود"
+            "المعذرة\n"
+            "لا يتوفر iD-File للرد"
         )
         return
 
     if not re.match(r"^https?://", text):
-        reply, keyboard = get_rotating_reply(
-            message.from_user.id
-        )
-
-        await message.reply(
-            reply,
-            reply_markup=keyboard,
-        )
+        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
+        if not is_group_or_channel or "بوت" in text:
+            reply, keyboard = get_rotating_reply(chat_id, user_id)
+            await message.reply(reply, reply_markup=keyboard)
         return
 
     if is_telegram_url(text):
-        reply, keyboard = get_rotating_reply(
-            message.from_user.id
-        )
-
-        await message.reply(
-            reply,
-            reply_markup=keyboard,
-        )
+        is_group_or_channel = message.chat.type in ["group", "supergroup", "channel"]
+        if not is_group_or_channel or "بوت" in text:
+            reply, keyboard = get_rotating_reply(chat_id, user_id)
+            await message.reply(reply, reply_markup=keyboard)
         return
 
     await add_download(
-        message.from_user.id,
+        chat_id,
+        user_id,
         text,
         bot,
         message,
