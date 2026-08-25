@@ -305,41 +305,51 @@ async def cleanup(folder):
 
 async def youtube_search(query):
     if not query or len(query) > 300:
-        raise RuntimeError()
+        raise RuntimeError("Invalid query")
 
     options = yt_options()
-    options["extract_flat"] = True
+    options["extract_flat"] = "in_playlist"
 
     def search():
-        with yt_dlp.YoutubeDL(options) as ydl:
-            result = ydl.extract_info(
-                f"ytsearch1:{query}",
-                download=False
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                result = ydl.extract_info(
+                    f"ytsearch1:{query}",
+                    download=False
+                )
+
+            if not result:
+                raise RuntimeError("No result")
+
+            entries = result.get("entries") or []
+
+            if not entries:
+                raise RuntimeError("No entries")
+
+            entry = entries[0]
+            if not entry:
+                raise RuntimeError("Empty entry")
+
+            url = (
+                entry.get("webpage_url")
+                or entry.get("original_url")
+                or entry.get("url")
             )
 
-        if not result:
-            raise RuntimeError()
+            if not url:
+                url_id = entry.get("id")
+                if url_id:
+                    url = f"https://www.youtube.com/watch?v={url_id}"
 
-        entries = result.get("entries") or []
+            if not url:
+                raise RuntimeError("No URL found")
 
-        if not entries:
-            raise RuntimeError()
+            if not url.startswith("http"):
+                url = f"https://www.youtube.com/watch?v={url}"
 
-        entry = entries[0]
-
-        url = (
-            entry.get("webpage_url")
-            or entry.get("original_url")
-            or entry.get("url")
-        )
-
-        if not url:
-            raise RuntimeError()
-
-        if not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={url}"
-
-        return url
+            return url
+        except Exception as e:
+            raise RuntimeError(str(e))
 
     return await asyncio.wait_for(
         asyncio.to_thread(search),
