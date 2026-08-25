@@ -1,22 +1,19 @@
 import os
 import json
 import uuid
-import random
 import asyncio
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 
 import yt_dlp
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.types import (
     Message,
     FSInputFile,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     ReplyParameters
 )
 
@@ -79,20 +76,60 @@ def load_data():
 def save_data():
     tmp = DATA_FILE.with_suffix(".tmp")
 
-    tmp.write_text(
-        json.dumps(
-            settings,
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8"
-    )
-
-    tmp.replace(DATA_FILE)
+    try:
+        tmp.write_text(
+            json.dumps(
+                settings,
+                ensure_ascii=False,
+                indent=2
+            ),
+            encoding="utf-8"
+        )
+        tmp.replace(DATA_FILE)
+    except Exception:
+        pass
 
 
 def is_admin(user_id):
     return user_id in ADMINS
+
+
+async def check_chat_admin(message: Message) -> bool:
+    if not message.from_user:
+        return True
+
+    if is_admin(message.from_user.id):
+        return True
+
+    try:
+        member = await bot.get_chat_member(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id
+        )
+
+        if member.status in (
+            ChatMemberStatus.CREATOR,
+            ChatMemberStatus.ADMINISTRATOR
+        ):
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def is_youtube_enabled(chat_id: int) -> bool:
+    key = str(chat_id)
+    chat_setting = settings.get(key, {})
+    return chat_setting.get("youtube", True)
+
+
+def set_youtube_enabled(chat_id: int, state: bool):
+    key = str(chat_id)
+    settings.setdefault(key, {})
+    settings[key]["youtube"] = state
+    save_data()
 
 
 def reply_parameters(message):
@@ -101,36 +138,16 @@ def reply_parameters(message):
     )
 
 
-def owner_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="المالك",
-                    url=f"tg://user?id={DEVELOPER_ID}"
-                )
-            ]
-        ]
-    )
-
-
 def failure_text(kind):
-    ending = random.choice(
-        (
-            "شم كسي يلا",
-            "شم طيزي يلا"
-        )
-    )
-
     if kind == "youtube":
         return (
             "اليوت غير مدعوم او العنوان غير متوفر\n"
-            f"{ending}"
+            "شم كسي يلا"
         )
 
     return (
-        "الرابط غير مدعوم او الرابط غير متوفر\n"
-        f"{ending}"
+        "الرابط غير مدعوم او الموقع غير مدعوم\n"
+        "شم كسي يلا"
     )
 
 
@@ -165,18 +182,50 @@ def valid_download_url(value):
     return True
 
 
+def clean_youtube_url(url):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+
+        if "youtube.com" in host or "youtu.be" in host:
+            if "youtu.be" in host:
+                vid = parsed.path.lstrip("/")
+                if vid:
+                    return f"https://www.youtube.com/watch?v={vid}"
+
+            qs = parse_qs(parsed.query)
+            if "v" in qs:
+                new_query = urlencode({"v": qs["v"][0]})
+                return urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    new_query,
+                    ""
+                ))
+    except Exception:
+        pass
+
+    return url
+
+
 def yt_options(outtmpl=None):
     options = {
         "quiet": True,
-        "no_warnings": False,
+        "no_warnings": True,
         "noplaylist": True,
+        "writethumbnails": False,
+        "addmetadata": False,
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
         "continuedl": False,
         "overwrites": True,
-        "js_runtimes": {
-            "deno": {}
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
         },
         "http_headers": {
             "User-Agent": (
@@ -203,13 +252,11 @@ async def cleanup(folder):
             return
 
         for item in folder.iterdir():
-
             if item.is_file() or item.is_symlink():
                 try:
                     item.unlink()
                 except Exception:
                     pass
-
             elif item.is_dir():
                 await cleanup(item)
 
@@ -227,7 +274,6 @@ async def youtube_search(query):
         raise RuntimeError()
 
     options = yt_options()
-
     options["extract_flat"] = True
 
     def search():
@@ -250,34 +296,38 @@ async def youtube_search(query):
         url = (
             entry.get("webpage_url")
             or entry.get("original_url")
+            or entry.get("url")
         )
 
         if not url:
             raise RuntimeError()
 
+        if not url.startswith("http"):
+            url = f"https://www.youtube.com/watch?v={url}"
+
         return url
 
-    return await asyncio.to_thread(search)
+    return await asyncio.wait_for(
+        asyncio.to_thread(search),
+        timeout=30
+    )
 
 
 async def download_voice(url, folder):
+    clean_url = clean_youtube_url(url)
     source = folder / "source.%(ext)s"
 
     options = yt_options(source)
 
     options.update({
-        "format": (
-            "bestaudio[ext=m4a]/"
-            "bestaudio[ext=webm]/"
-            "bestaudio/best"
-        ),
+        "format": "bestaudio/best",
         "max_filesize": MAX_DOWNLOAD_SIZE
     })
 
     def download():
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(
-                url,
+                clean_url,
                 download=True
             )
 
@@ -285,10 +335,12 @@ async def download_voice(url, folder):
 
             return Path(filename)
 
-    source_file = await asyncio.to_thread(download)
+    source_file = await asyncio.wait_for(
+        asyncio.to_thread(download),
+        timeout=180
+    )
 
     if not source_file.exists():
-
         candidates = [
             x
             for x in folder.iterdir()
@@ -321,8 +373,12 @@ async def download_voice(url, folder):
         "-i",
         str(source_file),
         "-vn",
+        "-map_metadata",
+        "-1",
         "-c:a",
         "libopus",
+        "-b:a",
+        "128k",
         "-vbr",
         "on",
         "-application",
@@ -353,6 +409,7 @@ async def process_download(item):
     url = item["url"]
     source_type = item["type"]
     original_message = item["original_message"]
+    status_message = item["status_message"]
 
     folder = Path(
         tempfile.mkdtemp(
@@ -369,11 +426,15 @@ async def process_download(item):
         await bot.send_voice(
             chat_id=chat_id,
             voice=FSInputFile(output),
-            reply_markup=owner_keyboard(),
             reply_parameters=reply_parameters(
                 original_message
             )
         )
+
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
 
         async with state_lock:
             key = str(chat_id)
@@ -400,14 +461,19 @@ async def process_download(item):
 
     except Exception:
         try:
-            await original_message.answer(
-                failure_text(source_type),
-                reply_parameters=reply_parameters(
-                    original_message
-                )
+            await status_message.edit_text(
+                failure_text(source_type)
             )
         except Exception:
-            pass
+            try:
+                await original_message.answer(
+                    failure_text(source_type),
+                    reply_parameters=reply_parameters(
+                        original_message
+                    )
+                )
+            except Exception:
+                pass
 
     finally:
         await cleanup(folder)
@@ -476,7 +542,8 @@ async def add_download(
     chat_id,
     url,
     source_type,
-    original_message
+    original_message,
+    status_message
 ):
     async with state_lock:
         active = running.get(
@@ -501,7 +568,8 @@ async def add_download(
             "chat_id": chat_id,
             "url": url,
             "type": source_type,
-            "original_message": original_message
+            "original_message": original_message,
+            "status_message": status_message
         })
 
         await start_worker(chat_id)
@@ -527,7 +595,8 @@ async def handle_download(
             message.chat.id,
             url,
             source_type,
-            message
+            message,
+            status
         )
 
         if not accepted:
@@ -551,17 +620,10 @@ async def handle_youtube(
     message,
     query
 ):
-    enabled = settings.get(
-        "_global",
-        {}
-    ).get(
-        "youtube",
-        True
-    )
-
-    if not enabled:
+    if not is_youtube_enabled(message.chat.id):
         return
 
+    status = None
     try:
         status = await message.answer(
             f"¹# - بدأت بالعثور ع {query} امهلني\n"
@@ -577,7 +639,8 @@ async def handle_youtube(
             message.chat.id,
             url,
             "youtube",
-            message
+            message,
+            status
         )
 
         if not accepted:
@@ -586,41 +649,35 @@ async def handle_youtube(
             )
 
     except Exception:
-        try:
-            await message.answer(
-                failure_text("youtube"),
-                reply_parameters=reply_parameters(
-                    message
+        if status:
+            try:
+                await status.edit_text(
+                    failure_text("youtube")
                 )
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
+        else:
+            try:
+                await message.answer(
+                    failure_text("youtube"),
+                    reply_parameters=reply_parameters(
+                        message
+                    )
+                )
+            except Exception:
+                pass
 
 
 @router.message(Command("تعطيل_اليوت"))
 @router.message(F.text == "تعطيل اليوت")
 async def disable_youtube(message: Message):
-    if not message.from_user:
+    if message.chat.type == ChatType.PRIVATE:
         return
 
-    if not is_admin(message.from_user.id):
+    if not await check_chat_admin(message):
         return
 
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    settings.setdefault(
-        "_global",
-        {}
-    )
-
-    current = settings["_global"].get(
-        "youtube",
-        True
-    )
+    current = is_youtube_enabled(message.chat.id)
 
     if current is False:
         text = (
@@ -628,8 +685,7 @@ async def disable_youtube(message: Message):
             "بالفعل"
         )
     else:
-        settings["_global"]["youtube"] = False
-        save_data()
+        set_youtube_enabled(message.chat.id, False)
 
         text = (
             "تم تعطيل اليوت\n"
@@ -647,27 +703,13 @@ async def disable_youtube(message: Message):
 @router.message(Command("تفعيل_اليوت"))
 @router.message(F.text == "تفعيل اليوت")
 async def enable_youtube(message: Message):
-    if not message.from_user:
+    if message.chat.type == ChatType.PRIVATE:
         return
 
-    if not is_admin(message.from_user.id):
+    if not await check_chat_admin(message):
         return
 
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    settings.setdefault(
-        "_global",
-        {}
-    )
-
-    current = settings["_global"].get(
-        "youtube",
-        True
-    )
+    current = is_youtube_enabled(message.chat.id)
 
     if current is True:
         text = (
@@ -675,8 +717,7 @@ async def enable_youtube(message: Message):
             "بالفعل"
         )
     else:
-        settings["_global"]["youtube"] = True
-        save_data()
+        set_youtube_enabled(message.chat.id, True)
 
         text = (
             "تم تفعيل اليوت\n"
@@ -750,56 +791,47 @@ async def channel_handler(message: Message):
 
     text = message.text.strip()
 
+    if text in ("تعطيل اليوت", "/تعطيل_اليوت"):
+        current = is_youtube_enabled(message.chat.id)
+        if current is False:
+            text_res = "تم تعطيل اليوت\nبالفعل"
+        else:
+            set_youtube_enabled(message.chat.id, False)
+            text_res = "تم تعطيل اليوت\nمولاي"
+
+        await message.answer(
+            text_res,
+            reply_parameters=reply_parameters(message)
+        )
+        return
+
+    if text in ("تفعيل اليوت", "/تفعيل_اليوت"):
+        current = is_youtube_enabled(message.chat.id)
+        if current is True:
+            text_res = "تم تفعيل اليوت\nبالفعل"
+        else:
+            set_youtube_enabled(message.chat.id, True)
+            text_res = "تم تفعيل اليوت\nمولاي"
+
+        await message.answer(
+            text_res,
+            reply_parameters=reply_parameters(message)
+        )
+        return
+
     if text.startswith("يوت"):
         query = text[3:].strip()
 
         if not query:
             return
 
-        enabled = settings.get(
-            "_global",
-            {}
-        ).get(
-            "youtube",
-            True
-        )
-
-        if not enabled:
+        if not is_youtube_enabled(message.chat.id):
             return
 
-        try:
-            status = await message.answer(
-                f"¹# - بدأت بالعثور ع {query} امهلني\n"
-                "قليلا فضلا وليس امرا",
-                reply_parameters=reply_parameters(
-                    message
-                )
-            )
-
-            url = await youtube_search(query)
-
-            accepted = await add_download(
-                message.chat.id,
-                url,
-                "youtube",
-                message
-            )
-
-            if not accepted:
-                await status.edit_text(
-                    failure_text("youtube")
-                )
-
-        except Exception:
-            try:
-                await message.answer(
-                    failure_text("youtube"),
-                    reply_parameters=reply_parameters(
-                        message
-                    )
-                )
-            except Exception:
-                pass
+        await handle_youtube(
+            message,
+            query
+        )
 
         return
 
@@ -839,28 +871,18 @@ async def startup_message():
 
 async def main():
     load_data()
-
-    settings.setdefault(
-        "_global",
-        {}
-    )
-
-    settings["_global"].setdefault(
-        "youtube",
-        True
-    )
-
-    save_data()
-
     await startup_message()
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message",
-            "channel_post"
-        ]
-    )
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                "message",
+                "channel_post"
+            ]
+        )
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
