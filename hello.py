@@ -16,7 +16,8 @@ from aiogram.types import (
     FSInputFile,
     ReplyParameters,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    CallbackQuery
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -66,7 +67,7 @@ def get_developer_keyboard():
             [
                 InlineKeyboardButton(
                     text="المطور",
-                    url=f"tg://user?id={DEVELOPER_ID}",
+                    callback_data="dev_info",
                     style="danger"
                 )
             ]
@@ -728,6 +729,14 @@ async def handle_youtube(
                 pass
 
 
+@router.callback_query(F.data == "dev_info")
+async def dev_info_callback(call: CallbackQuery):
+    await call.answer(
+        text=f"المطور: tg://user?id={DEVELOPER_ID}",
+        show_alert=True
+    )
+
+
 @router.message(Command("تعطيل_اليوت"))
 @router.message(F.text == "تعطيل اليوت")
 async def disable_youtube(message: Message):
@@ -938,7 +947,8 @@ async def main():
             bot,
             allowed_updates=[
                 "message",
-                "channel_post"
+                "channel_post",
+                "callback_query"
             ]
         )
     finally:
