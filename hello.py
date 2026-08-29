@@ -18,7 +18,10 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputMediaPhoto,
-    InputMediaVideo
+    InputMediaVideo,
+    InputMediaVoiceNote,
+    InputRichMessage,
+    InputRichBlockVoiceNote
 )
 
 
@@ -63,6 +66,7 @@ async def initialize():
                 )
             )
         """)
+
         await db.commit()
 
 
@@ -110,6 +114,7 @@ async def save_mode(key, mode):
                 mode
             )
         )
+
         await db.commit()
 
 
@@ -163,6 +168,7 @@ async def save_cached_file(
                 file_id
             )
         )
+
         await db.commit()
 
 
@@ -193,6 +199,21 @@ def youtube_title(text):
     return text.strip().split(
         maxsplit=1
     )[1].strip()
+
+
+def format_youtube_title(title):
+    title = title.lower()
+
+    special = set(
+        "atgfnmjlu"
+    )
+
+    return "".join(
+        char.upper()
+        if char in special
+        else char
+        for char in title
+    )
 
 
 def reply_parameters(message):
@@ -282,7 +303,9 @@ def downloaded_files(info, directory):
         if not entry:
             return
 
-        filepath = entry.get("filepath")
+        filepath = entry.get(
+            "filepath"
+        )
 
         if filepath and os.path.isfile(filepath):
             if filepath not in result:
@@ -292,13 +315,17 @@ def downloaded_files(info, directory):
             entry.get("requested_downloads")
             or []
         ):
-            filepath = item.get("filepath")
+            filepath = item.get(
+                "filepath"
+            )
 
             if filepath and os.path.isfile(filepath):
                 if filepath not in result:
                     result.append(filepath)
 
-    entries = info.get("entries")
+    entries = info.get(
+        "entries"
+    )
 
     if entries:
         for entry in entries:
@@ -344,9 +371,11 @@ async def default_download(
     def run():
         options = {
             "outtmpl": str(
-                Path(directory) / "%(title)s.%(ext)s"
+                Path(directory) /
+                "%(title)s.%(ext)s"
             ),
-            "format": "bestvideo*+bestaudio/best",
+            "format":
+                "bestvideo*+bestaudio/best",
             "noplaylist": False,
             "quiet": True,
             "no_warnings": True,
@@ -364,14 +393,18 @@ async def default_download(
 
         output = []
 
-        entries = info.get("entries")
+        entries = info.get(
+            "entries"
+        )
 
         if entries:
             for entry in entries:
                 if not entry:
                     continue
 
-                content_id = entry.get("id")
+                content_id = entry.get(
+                    "id"
+                )
 
                 for filepath in downloaded_files(
                     entry,
@@ -384,7 +417,9 @@ async def default_download(
                         )
                     )
         else:
-            content_id = info.get("id")
+            content_id = info.get(
+                "id"
+            )
 
             for filepath in downloaded_files(
                 info,
@@ -399,7 +434,9 @@ async def default_download(
 
         return output
 
-    return await asyncio.to_thread(run)
+    return await asyncio.to_thread(
+        run
+    )
 
 
 async def audio_download(
@@ -409,7 +446,8 @@ async def audio_download(
     def run():
         options = {
             "outtmpl": str(
-                Path(directory) / "%(title)s.%(ext)s"
+                Path(directory) /
+                "%(title)s.%(ext)s"
             ),
             "format": "bestaudio/best",
             "noplaylist": True,
@@ -434,10 +472,13 @@ async def audio_download(
         if not files:
             raise FileNotFoundError()
 
-        return info.get("id"), files[0]
+        return (
+            info.get("id"),
+            files[0]
+        )
 
-    content_id, source = await asyncio.to_thread(
-        run
+    content_id, source = (
+        await asyncio.to_thread(run)
     )
 
     cached = await get_cached_file(
@@ -447,10 +488,15 @@ async def audio_download(
     )
 
     if cached:
-        return content_id, None, cached
+        return (
+            content_id,
+            None,
+            cached
+        )
 
     output = str(
-        Path(directory) / "audio.ogg"
+        Path(directory) /
+        "audio.ogg"
     )
 
     await asyncio.to_thread(
@@ -473,17 +519,24 @@ async def audio_download(
         )
     )
 
-    return content_id, output, None
+    return (
+        content_id,
+        output,
+        None
+    )
 
 
 async def youtube_audio(
     title,
     directory
 ):
+    search_title = title.casefold()
+
     def run():
         options = {
             "outtmpl": str(
-                Path(directory) / "%(title)s.%(ext)s"
+                Path(directory) /
+                "%(title)s.%(ext)s"
             ),
             "format": "bestaudio/best",
             "noplaylist": True,
@@ -493,14 +546,17 @@ async def youtube_audio(
 
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(
-                f"ytsearch1:{title}",
+                f"ytsearch1:{search_title}",
                 download=True
             )
 
         if not info:
             raise FileNotFoundError()
 
-        entries = info.get("entries") or []
+        entries = (
+            info.get("entries")
+            or []
+        )
 
         if not entries:
             raise FileNotFoundError()
@@ -515,10 +571,13 @@ async def youtube_audio(
         if not files:
             raise FileNotFoundError()
 
-        return entry.get("id"), files[0]
+        return (
+            entry.get("id"),
+            files[0]
+        )
 
-    content_id, source = await asyncio.to_thread(
-        run
+    content_id, source = (
+        await asyncio.to_thread(run)
     )
 
     cached = await get_cached_file(
@@ -528,10 +587,15 @@ async def youtube_audio(
     )
 
     if cached:
-        return content_id, None, cached
+        return (
+            content_id,
+            None,
+            cached
+        )
 
     output = str(
-        Path(directory) / "youtube.ogg"
+        Path(directory) /
+        "youtube.ogg"
     )
 
     await asyncio.to_thread(
@@ -554,7 +618,73 @@ async def youtube_audio(
         )
     )
 
-    return content_id, output, None
+    return (
+        content_id,
+        output,
+        None
+    )
+
+
+async def edit_message_as_voice(
+    message,
+    filepath=None,
+    cached_file_id=None
+):
+    file_id = cached_file_id
+    temporary_message = None
+
+    if not file_id:
+        if not filepath:
+            raise ValueError(
+                "filepath or cached_file_id is required"
+            )
+
+        temporary_message = await bot.send_voice(
+            message.chat.id,
+            FSInputFile(
+                filepath,
+                filename=Path(filepath).name
+            ),
+            message_thread_id=message.message_thread_id
+        )
+
+        file_id = (
+            temporary_message
+            .voice
+            .file_id
+        )
+
+    rich_voice = InputRichMessage(
+        blocks=[
+            InputRichBlockVoiceNote(
+                voice_note=InputMediaVoiceNote(
+                    media=file_id
+                )
+            )
+        ]
+    )
+
+    try:
+        edited = await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            rich_message=rich_voice
+        )
+
+    finally:
+        if temporary_message:
+            try:
+                await bot.delete_message(
+                    message.chat.id,
+                    temporary_message.message_id
+                )
+            except Exception:
+                pass
+
+    return (
+        edited,
+        file_id
+    )
 
 
 async def send_media(
@@ -615,7 +745,11 @@ async def send_media(
             reply_parameters=reply
         )
 
-        file_id = sent.photo[-1].file_id
+        file_id = (
+            sent
+            .photo[-1]
+            .file_id
+        )
 
     elif media_type == "video":
         sent = await bot.send_video(
@@ -723,9 +857,13 @@ async def send_album(
                 media_type
             )
 
-            media_file = cached or FSInputFile(
-                filepath,
-                filename=Path(filepath).name
+            media_file = (
+                cached
+                or
+                FSInputFile(
+                    filepath,
+                    filename=Path(filepath).name
+                )
             )
 
             if media_type == "photo":
@@ -734,6 +872,7 @@ async def send_album(
                         media=media_file
                     )
                 )
+
             else:
                 media.append(
                     InputMediaVideo(
@@ -767,7 +906,9 @@ async def send_album(
             message.chat.id,
             media=media,
             message_thread_id=message.message_thread_id,
-            reply_parameters=reply_parameters(message)
+            reply_parameters=reply_parameters(
+                message
+            )
         )
 
         for sent_message, data in zip(
@@ -777,9 +918,18 @@ async def send_album(
             content_id, media_type = data
 
             if media_type == "photo":
-                file_id = sent_message.photo[-1].file_id
+                file_id = (
+                    sent_message
+                    .photo[-1]
+                    .file_id
+                )
+
             else:
-                file_id = sent_message.video.file_id
+                file_id = (
+                    sent_message
+                    .video
+                    .file_id
+                )
 
             await save_cached_file(
                 content_id,
@@ -806,19 +956,28 @@ async def process(
                 message.text
             )
 
+            display_title = (
+                format_youtube_title(
+                    title
+                )
+            )
+
             progress_text = (
-                f"ها تريد {title}\n"
+                f"ها تريد {display_title}\n"
                 "بلة انطيني شوي من وقتك"
             )
+
             error_text = (
                 "لقد تعثرت المعذرة \n"
                 "هذا العنوان غير متوفر"
             )
+
         else:
             progress_text = (
                 "شو يعني من تدز رابط تريد اشتغل مو\n"
                 "ديلا يلا ماشي"
             )
+
             error_text = (
                 "الرابط غير مدعوم او الموقع غير مدعوم \n"
                 "ههع شم كسي يلا"
@@ -828,7 +987,9 @@ async def process(
             message.chat.id,
             progress_text,
             message_thread_id=message.message_thread_id,
-            reply_parameters=reply_parameters(message)
+            reply_parameters=reply_parameters(
+                message
+            )
         )
 
         try:
@@ -860,13 +1021,22 @@ async def process(
                     )
                 )
 
-                await send_voice(
-                    message,
-                    filepath,
+                edited, file_id = (
+                    await edit_message_as_voice(
+                        progress_msg,
+                        filepath=filepath,
+                        cached_file_id=cached
+                    )
+                )
+
+                await save_cached_file(
                     content_id,
                     mode,
-                    cached
+                    "voice",
+                    file_id
                 )
+
+                progress_msg = None
 
             else:
                 items = await default_download(
@@ -880,9 +1050,11 @@ async def process(
                     if not content_id:
                         continue
 
-                    media_type = await asyncio.to_thread(
-                        detect_type,
-                        filepath
+                    media_type = (
+                        await asyncio.to_thread(
+                            detect_type,
+                            filepath
+                        )
                     )
 
                     if media_type in {
@@ -912,6 +1084,7 @@ async def process(
                         media,
                         mode
                     )
+
                 else:
                     raise FileNotFoundError()
 
@@ -967,7 +1140,9 @@ async def enqueue(
     message,
     mode
 ):
-    key = chat_key(message)
+    key = chat_key(
+        message
+    )
 
     async with queue_locks[key]:
         if active[key] < MAX_ACTIVE:
@@ -995,14 +1170,23 @@ async def enqueue(
 async def show_settings(
     message
 ):
-    key = chat_key(message)
-    mode = await get_mode(key)
+    key = chat_key(
+        message
+    )
+
+    mode = await get_mode(
+        key
+    )
 
     await message.answer(
         "تستطيع تغيير وضع عمل البوت من هذه\n"
         "الازرار",
-        reply_markup=settings_keyboard(mode),
-        reply_parameters=reply_parameters(message)
+        reply_markup=settings_keyboard(
+            mode
+        ),
+        reply_parameters=reply_parameters(
+            message
+        )
     )
 
 
@@ -1016,7 +1200,9 @@ async def settings_callback(
         callback.message
     )
 
-    current = await get_mode(key)
+    current = await get_mode(
+        key
+    )
 
     selected = callback.data.split(
         ":",
@@ -1030,6 +1216,7 @@ async def settings_callback(
                 "تستطيع تبديل الوضع وليس تعطيل كل الاوضاع",
                 show_alert=False
             )
+
             return
 
         await save_mode(
@@ -1044,6 +1231,7 @@ async def settings_callback(
         )
 
         await callback.answer()
+
         return
 
     await save_mode(
@@ -1069,7 +1257,10 @@ async def on_message(
     text = message.text.strip()
 
     if text.casefold() == "ادت":
-        await show_settings(message)
+        await show_settings(
+            message
+        )
+
         return
 
     if youtube_command(text):
@@ -1077,6 +1268,7 @@ async def on_message(
             message,
             "youtube_voice"
         )
+
         return
 
     if not is_url(text):
@@ -1101,6 +1293,7 @@ async def on_callback(
         await settings_callback(
             callback
         )
+
         return
 
     await callback.answer()
@@ -1144,4 +1337,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main)
