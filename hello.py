@@ -1,6 +1,5 @@
 import os
 import asyncio
-import sqlite3
 import tempfile
 import shutil
 import subprocess
@@ -8,6 +7,7 @@ import mimetypes
 from pathlib import Path
 from collections import defaultdict, deque
 
+import aiosqlite
 import yt_dlp
 
 from aiogram import Bot, Dispatcher, F
@@ -36,41 +36,34 @@ active = defaultdict(int)
 queue_locks = defaultdict(asyncio.Lock)
 
 
-def connection():
-    return sqlite3.connect(DATABASE)
-
-
-def initialize():
-    conn = connection()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cache (
-            content_id TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            PRIMARY KEY (
-                content_id,
-                mode,
-                media_type
+async def initialize():
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                content_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                PRIMARY KEY (
+                    content_id,
+                    mode,
+                    media_type
+                )
             )
-        )
-    """)
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            chat_id INTEGER NOT NULL,
-            topic_id INTEGER NOT NULL,
-            mode TEXT NOT NULL,
-            PRIMARY KEY (
-                chat_id,
-                topic_id
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                chat_id INTEGER NOT NULL,
+                topic_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                PRIMARY KEY (
+                    chat_id,
+                    topic_id
+                )
             )
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+        """)
+        await db.commit()
 
 
 def chat_key(message):
@@ -80,20 +73,18 @@ def chat_key(message):
     )
 
 
-def get_mode(key):
-    conn = connection()
-
-    row = conn.execute(
-        """
-        SELECT mode
-        FROM settings
-        WHERE chat_id = ?
-        AND topic_id = ?
-        """,
-        key
-    ).fetchone()
-
-    conn.close()
+async def get_mode(key):
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            """
+            SELECT mode
+            FROM settings
+            WHERE chat_id = ?
+            AND topic_id = ?
+            """,
+            key
+        ) as cursor:
+            row = await cursor.fetchone()
 
     if row:
         return row[0]
@@ -101,86 +92,78 @@ def get_mode(key):
     return "default"
 
 
-def save_mode(key, mode):
-    conn = connection()
-
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO settings
-        (
-            chat_id,
-            topic_id,
-            mode
+async def save_mode(key, mode):
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO settings
+            (
+                chat_id,
+                topic_id,
+                mode
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                key[0],
+                key[1],
+                mode
+            )
         )
-        VALUES (?, ?, ?)
-        """,
-        (
-            key[0],
-            key[1],
-            mode
-        )
-    )
-
-    conn.commit()
-    conn.close()
+        await db.commit()
 
 
-def get_cached_file(
+async def get_cached_file(
     content_id,
     mode,
     media_type
 ):
-    conn = connection()
-
-    row = conn.execute(
-        """
-        SELECT file_id
-        FROM cache
-        WHERE content_id = ?
-        AND mode = ?
-        AND media_type = ?
-        """,
-        (
-            content_id,
-            mode,
-            media_type
-        )
-    ).fetchone()
-
-    conn.close()
+    async with aiosqlite.connect(DATABASE) as db:
+        async with db.execute(
+            """
+            SELECT file_id
+            FROM cache
+            WHERE content_id = ?
+            AND mode = ?
+            AND media_type = ?
+            """,
+            (
+                content_id,
+                mode,
+                media_type
+            )
+        ) as cursor:
+            row = await cursor.fetchone()
 
     return row[0] if row else None
 
 
-def save_cached_file(
+async def save_cached_file(
     content_id,
     mode,
     media_type,
     file_id
 ):
-    conn = connection()
-
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO cache
-        (
-            content_id,
-            mode,
-            media_type,
-            file_id
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO cache
+            (
+                content_id,
+                mode,
+                media_type,
+                file_id
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                content_id,
+                mode,
+                media_type,
+                file_id
+            )
         )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            content_id,
-            mode,
-            media_type,
-            file_id
-        )
-    )
-
-    conn.commit()
-    conn.close()
+        await db.commit()
 
 
 def is_url(text):
@@ -376,6 +359,9 @@ async def default_download(
                 download=True
             )
 
+        if not info:
+            raise FileNotFoundError()
+
         output = []
 
         entries = info.get("entries")
@@ -437,6 +423,9 @@ async def audio_download(
                 download=True
             )
 
+        if not info:
+            raise FileNotFoundError()
+
         files = downloaded_files(
             info,
             directory
@@ -451,7 +440,7 @@ async def audio_download(
         run
     )
 
-    cached = get_cached_file(
+    cached = await get_cached_file(
         content_id,
         "audio",
         "voice"
@@ -508,6 +497,9 @@ async def youtube_audio(
                 download=True
             )
 
+        if not info:
+            raise FileNotFoundError()
+
         entries = info.get("entries") or []
 
         if not entries:
@@ -529,7 +521,7 @@ async def youtube_audio(
         run
     )
 
-    cached = get_cached_file(
+    cached = await get_cached_file(
         content_id,
         "youtube_voice",
         "voice"
@@ -576,7 +568,7 @@ async def send_media(
         filepath
     )
 
-    cached = get_cached_file(
+    cached = await get_cached_file(
         content_id,
         mode,
         media_type
@@ -645,7 +637,7 @@ async def send_media(
 
         file_id = sent.document.file_id
 
-    save_cached_file(
+    await save_cached_file(
         content_id,
         mode,
         media_type,
@@ -686,7 +678,7 @@ async def send_voice(
         reply_parameters=reply
     )
 
-    save_cached_file(
+    await save_cached_file(
         content_id,
         mode,
         "voice",
@@ -725,7 +717,7 @@ async def send_album(
             }:
                 continue
 
-            cached = get_cached_file(
+            cached = await get_cached_file(
                 content_id,
                 mode,
                 media_type
@@ -789,7 +781,7 @@ async def send_album(
             else:
                 file_id = sent_message.video.file_id
 
-            save_cached_file(
+            await save_cached_file(
                 content_id,
                 mode,
                 media_type,
@@ -806,86 +798,136 @@ async def process(
         prefix="download_"
     )
 
+    progress_msg = None
+
     try:
-        if mode == "audio":
-            content_id, filepath, cached = (
-                await audio_download(
-                    message.text,
-                    directory
-                )
-            )
-
-            await send_voice(
-                message,
-                filepath,
-                content_id,
-                mode,
-                cached
-            )
-
-        elif mode == "youtube_voice":
+        if mode == "youtube_voice":
             title = youtube_title(
                 message.text
             )
 
-            content_id, filepath, cached = (
-                await youtube_audio(
-                    title,
-                    directory
-                )
+            progress_text = (
+                f"ها تريد {title}\n"
+                "بلة انطيني شوي من وقتك"
             )
-
-            await send_voice(
-                message,
-                filepath,
-                content_id,
-                mode,
-                cached
+            error_text = (
+                "لقد تعثرت المعذرة \n"
+                "هذا العنوان غير متوفر"
             )
-
         else:
-            items = await default_download(
-                message.text,
-                directory
+            progress_text = (
+                "?!\n"
+                "شو يعني من تدز رابط اشتغل هيج تريد\n"
+                "ديلا يلا ماشي"
+            )
+            error_text = (
+                "الرابط غير مدعوم او الموقع غير مدعوم \n"
+                "ههع شم كسي يلا"
             )
 
-            media = []
+        progress_msg = await bot.send_message(
+            message.chat.id,
+            progress_text,
+            message_thread_id=message.message_thread_id,
+            reply_parameters=reply_parameters(message)
+        )
 
-            for content_id, filepath in items:
-                if not content_id:
-                    continue
-
-                media_type = await asyncio.to_thread(
-                    detect_type,
-                    filepath
+        try:
+            if mode == "audio":
+                content_id, filepath, cached = (
+                    await audio_download(
+                        message.text,
+                        directory
+                    )
                 )
 
-                if media_type in {
-                    "photo",
-                    "video"
-                }:
-                    media.append(
-                        (
-                            content_id,
-                            filepath
-                        )
-                    )
-
-            if len(media) == 1:
-                content_id, filepath = media[0]
-
-                await send_media(
+                await send_voice(
                     message,
                     filepath,
                     content_id,
-                    mode
+                    mode,
+                    cached
                 )
 
-            elif media:
-                await send_album(
+            elif mode == "youtube_voice":
+                title = youtube_title(
+                    message.text
+                )
+
+                content_id, filepath, cached = (
+                    await youtube_audio(
+                        title,
+                        directory
+                    )
+                )
+
+                await send_voice(
                     message,
-                    media,
-                    mode
+                    filepath,
+                    content_id,
+                    mode,
+                    cached
+                )
+
+            else:
+                items = await default_download(
+                    message.text,
+                    directory
+                )
+
+                media = []
+
+                for content_id, filepath in items:
+                    if not content_id:
+                        continue
+
+                    media_type = await asyncio.to_thread(
+                        detect_type,
+                        filepath
+                    )
+
+                    if media_type in {
+                        "photo",
+                        "video"
+                    }:
+                        media.append(
+                            (
+                                content_id,
+                                filepath
+                            )
+                        )
+
+                if len(media) == 1:
+                    content_id, filepath = media[0]
+
+                    await send_media(
+                        message,
+                        filepath,
+                        content_id,
+                        mode
+                    )
+
+                elif media:
+                    await send_album(
+                        message,
+                        media,
+                        mode
+                    )
+                else:
+                    raise FileNotFoundError()
+
+            if progress_msg:
+                await bot.delete_message(
+                    message.chat.id,
+                    progress_msg.message_id
+                )
+
+        except Exception:
+            if progress_msg:
+                await bot.edit_message_text(
+                    error_text,
+                    chat_id=message.chat.id,
+                    message_id=progress_msg.message_id
                 )
 
     finally:
@@ -955,7 +997,7 @@ async def show_settings(
     message
 ):
     key = chat_key(message)
-    mode = get_mode(key)
+    mode = await get_mode(key)
 
     await message.answer(
         "تستطيع تغيير وضع عمل البوت من هذه\n"
@@ -975,7 +1017,7 @@ async def settings_callback(
         callback.message
     )
 
-    current = get_mode(key)
+    current = await get_mode(key)
 
     selected = callback.data.split(
         ":",
@@ -991,7 +1033,7 @@ async def settings_callback(
             )
             return
 
-        save_mode(
+        await save_mode(
             key,
             "default"
         )
@@ -1005,7 +1047,7 @@ async def settings_callback(
         await callback.answer()
         return
 
-    save_mode(
+    await save_mode(
         key,
         selected
     )
@@ -1041,7 +1083,7 @@ async def on_message(
     if not is_url(text):
         return
 
-    mode = get_mode(
+    mode = await get_mode(
         chat_key(message)
     )
 
@@ -1073,7 +1115,7 @@ async def main():
             "BOT_TOKEN is missing"
         )
 
-    initialize()
+    await initialize()
 
     bot = Bot(
         token=BOT_TOKEN
