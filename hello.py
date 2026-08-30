@@ -55,30 +55,27 @@ TELEGRAM_RE = re.compile(
 )
 
 
+MAX_ACTIVE = 3
+MAX_WAITING = 3
+
+
 user_modes = {}
 reply_indexes = {}
 mode_messages = {}
 chat_queues = {}
 
 
-MAX_ACTIVE = 3
-MAX_WAITING = 3
-
-
-def state_key(message):
+def key_for(message):
     user_id = (
         message.from_user.id
         if message.from_user
         else 0
     )
 
-    return (
-        message.chat.id,
-        user_id,
-    )
+    return message.chat.id, user_id
 
 
-def reply_to(message):
+def reply_params(message):
     return ReplyParameters(
         message_id=message.message_id,
         allow_sending_without_reply=True,
@@ -102,75 +99,27 @@ def is_telegram_url(url):
     )
 
 
-def get_mode(key):
-    return user_modes.get(
-        key,
-        "default",
-    )
+def ytdlp_options(**extra):
+    options = {
+        "quiet": True,
+        "no_warnings": False,
+        "noplaylist": True,
+        "remote_components": (
+            "ejs:github",
+        ),
+    }
+
+    options.update(extra)
+
+    return options
 
 
-def get_mode_keyboard(key):
-    mode = get_mode(key)
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="صوت",
-                    callback_data="mode:voice",
-                    style=(
-                        "primary"
-                        if mode == "voice"
-                        else "danger"
-                    ),
-                ),
-                InlineKeyboardButton(
-                    text="افتراضي",
-                    callback_data="mode:default",
-                    style=(
-                        "primary"
-                        if mode == "default"
-                        else "danger"
-                    ),
-                ),
-            ]
-        ]
-    )
-
-
-async def send_mode_panel(message):
-    key = state_key(message)
-
-    old_message_id = mode_messages.get(key)
-
-    if old_message_id:
-        try:
-            await bot.delete_message(
-                chat_id=message.chat.id,
-                message_id=old_message_id,
-            )
-        except Exception:
-            pass
-
-    sent = await message.answer(
-        "تستطيع تغيير وضع عمل البوت\nمن هنا",
-        reply_markup=get_mode_keyboard(key),
-        reply_parameters=reply_to(message),
-    )
-
-    mode_messages[key] = sent.message_id
-
-
-def get_files(directory):
-    return [
+def latest_file(directory):
+    files = [
         path
         for path in Path(directory).rglob("*")
         if path.is_file()
     ]
-
-
-def get_latest_file(directory):
-    files = get_files(directory)
 
     if not files:
         raise RuntimeError(
@@ -183,24 +132,38 @@ def get_latest_file(directory):
     )
 
 
-def youtube_options():
-    return {
-        "quiet": True,
-        "no_warnings": False,
-        "noplaylist": True,
-        "remote_components": [
-            "ejs:github",
-        ],
-    }
+def download_file(
+    url,
+    directory,
+    mode,
+):
+    if mode == "audio":
+        file_format = "bestaudio/best"
+    else:
+        file_format = (
+            "bestvideo*+bestaudio/"
+            "best"
+        )
+
+    options = ytdlp_options(
+        format=file_format,
+        outtmpl=str(
+            Path(directory)
+            / "%(title)s.%(ext)s"
+        ),
+    )
+
+    with YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+    return latest_file(directory)
 
 
-def search_youtube(query):
-    options = youtube_options()
-
-    options.update({
-        "extract_flat": True,
-        "skip_download": True,
-    })
+def youtube_search(query):
+    options = ytdlp_options(
+        extract_flat=True,
+        skip_download=True,
+    )
 
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(
@@ -217,7 +180,9 @@ def search_youtube(query):
 
     result = entries[0]
 
-    url = result.get("webpage_url")
+    url = result.get(
+        "webpage_url"
+    )
 
     if not url:
         video_id = result.get("id")
@@ -233,43 +198,6 @@ def search_youtube(query):
         )
 
     return url
-
-
-def download_audio(url, directory):
-    options = youtube_options()
-
-    options.update({
-        "format": "bestaudio/best",
-        "outtmpl": str(
-            Path(directory)
-            / "%(title)s.%(ext)s"
-        ),
-    })
-
-    with YoutubeDL(options) as ydl:
-        ydl.download([url])
-
-    return get_latest_file(directory)
-
-
-def download_video(url, directory):
-    options = youtube_options()
-
-    options.update({
-        "format": (
-            "bestvideo*+bestaudio/"
-            "best"
-        ),
-        "outtmpl": str(
-            Path(directory)
-            / "%(title)s.%(ext)s"
-        ),
-    })
-
-    with YoutubeDL(options) as ydl:
-        ydl.download([url])
-
-    return get_latest_file(directory)
 
 
 async def convert_to_opus(
@@ -315,15 +243,16 @@ async def convert_to_opus(
     return output
 
 
-async def process_voice(
+async def send_opus(
     message,
     url,
 ):
     with tempfile.TemporaryDirectory() as directory:
         source = await asyncio.to_thread(
-            download_audio,
+            download_file,
             url,
             directory,
+            "audio",
         )
 
         output = await convert_to_opus(
@@ -340,48 +269,22 @@ async def process_voice(
                 data,
                 filename="voice.ogg",
             ),
-            reply_parameters=reply_to(message),
-        )
-
-
-async def process_youtube_voice(
-    message,
-    url,
-):
-    with tempfile.TemporaryDirectory() as directory:
-        source = await asyncio.to_thread(
-            download_audio,
-            url,
-            directory,
-        )
-
-        output = await convert_to_opus(
-            source,
-            directory,
-        )
-
-        data = await asyncio.to_thread(
-            output.read_bytes
-        )
-
-        await message.answer_voice(
-            BufferedInputFile(
-                data,
-                filename="voice.ogg",
+            reply_parameters=reply_params(
+                message
             ),
-            reply_parameters=reply_to(message),
         )
 
 
-async def process_video(
+async def send_video(
     message,
     url,
 ):
     with tempfile.TemporaryDirectory() as directory:
         source = await asyncio.to_thread(
-            download_video,
+            download_file,
             url,
             directory,
+            "video",
         )
 
         data = await asyncio.to_thread(
@@ -394,82 +297,141 @@ async def process_video(
                 filename=source.name,
             ),
             supports_streaming=True,
-            reply_parameters=reply_to(message),
+            reply_parameters=reply_params(
+                message
+            ),
         )
 
 
-async def run_download(
+def mode_keyboard(mode):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="صوت",
+                    callback_data="mode:voice",
+                    style=(
+                        "primary"
+                        if mode == "voice"
+                        else "danger"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="افتراضي",
+                    callback_data="mode:default",
+                    style=(
+                        "primary"
+                        if mode == "default"
+                        else "danger"
+                    ),
+                ),
+            ]
+        ]
+    )
+
+
+async def send_mode_panel(message):
+    key = key_for(message)
+
+    old_message = mode_messages.get(key)
+
+    if old_message:
+        try:
+            await bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=old_message,
+            )
+        except Exception:
+            pass
+
+    mode = user_modes.get(
+        key,
+        "default",
+    )
+
+    sent = await message.answer(
+        "تستطيع تغيير وضع عمل البوت\nمن هنا",
+        reply_markup=mode_keyboard(mode),
+        reply_parameters=reply_params(
+            message
+        ),
+    )
+
+    mode_messages[key] = sent.message_id
+
+
+async def normal_download(
     message,
     url,
     mode,
-    status_message,
+    status,
 ):
     try:
         if mode == "voice":
-            await process_voice(
+            await send_opus(
                 message,
                 url,
             )
         else:
-            await process_video(
+            await send_video(
                 message,
                 url,
             )
 
-        try:
-            await status_message.delete()
-        except Exception:
-            pass
+        await status.delete()
 
     except Exception:
         try:
-            await status_message.delete()
+            await status.delete()
         except Exception:
             pass
 
         await message.answer(
             FAIL_REPLY,
-            reply_parameters=reply_to(message),
+            reply_parameters=reply_params(
+                message
+            ),
         )
 
 
-async def youtube_job(
+async def youtube_download(
     message,
     query,
 ):
-    status_message = None
+    status = None
 
     try:
+        status = await message.answer(
+            START_REPLY,
+            reply_parameters=reply_params(
+                message
+            ),
+        )
+
         url = await asyncio.to_thread(
-            search_youtube,
+            youtube_search,
             query,
         )
 
-        status_message = await message.answer(
-            START_REPLY,
-            reply_parameters=reply_to(message),
-        )
-
-        await process_youtube_voice(
+        await send_opus(
             message,
             url,
         )
 
-        try:
-            await status_message.delete()
-        except Exception:
-            pass
+        await status.delete()
 
     except Exception:
-        if status_message:
+        if status:
             try:
-                await status_message.delete()
+                await status.delete()
             except Exception:
                 pass
 
         await message.answer(
             FAIL_REPLY,
-            reply_parameters=reply_to(message),
+            reply_parameters=reply_params(
+                message
+            ),
         )
 
 
@@ -484,8 +446,6 @@ async def worker(chat_id):
 
         try:
             await job()
-        except Exception:
-            pass
         finally:
             data["active"] -= 1
             data["queue"].task_done()
@@ -496,19 +456,14 @@ async def ensure_chat(chat_id):
         return
 
     chat_queues[chat_id] = {
+        "queue": asyncio.Queue(),
         "active": 0,
         "waiting": 0,
-        "queue": asyncio.Queue(),
-        "workers": [],
     }
 
     for _ in range(MAX_ACTIVE):
-        task = asyncio.create_task(
+        asyncio.create_task(
             worker(chat_id)
-        )
-
-        chat_queues[chat_id]["workers"].append(
-            task
         )
 
 
@@ -525,7 +480,8 @@ async def add_job(
     if (
         data["active"]
         + data["waiting"]
-        >= MAX_ACTIVE + MAX_WAITING
+        >= MAX_ACTIVE
+        + MAX_WAITING
     ):
         return False
 
@@ -538,7 +494,7 @@ async def add_job(
 
 @dp.message(CommandStart())
 async def start_handler(message):
-    key = state_key(message)
+    key = key_for(message)
 
     user_modes.setdefault(
         key,
@@ -555,7 +511,7 @@ async def start_handler(message):
 
 @dp.message(F.text == "ادت")
 async def mode_handler(message):
-    key = state_key(message)
+    key = key_for(message)
 
     user_modes.setdefault(
         key,
@@ -585,24 +541,24 @@ async def mode_callback(
         callback.from_user.id,
     )
 
-    selected_mode = callback.data.split(
+    mode = callback.data.split(
         ":",
         1,
     )[1]
 
-    if selected_mode not in {
+    if mode not in (
         "voice",
         "default",
-    }:
+    ):
         await callback.answer()
         return
 
-    user_modes[key] = selected_mode
+    user_modes[key] = mode
 
     try:
         await callback.message.edit_reply_markup(
-            reply_markup=get_mode_keyboard(
-                key
+            reply_markup=mode_keyboard(
+                mode
             )
         )
     except Exception:
@@ -613,7 +569,7 @@ async def mode_callback(
 
 @dp.message(F.text)
 async def text_handler(message):
-    key = state_key(message)
+    key = key_for(message)
 
     user_modes.setdefault(
         key,
@@ -625,29 +581,28 @@ async def text_handler(message):
         0,
     )
 
-    text = message.text or ""
-    stripped = text.strip()
+    text = message.text.strip()
 
     if (
-        stripped.startswith("يوت")
-        and len(stripped) > 3
-        and stripped[3].isspace()
+        text.startswith("يوت")
+        and len(text) > 3
+        and text[3].isspace()
     ):
-        query = stripped[3:].strip()
+        query = text[3:].strip()
 
         if query:
             await message.answer(
                 YOUTUBE_REPLY.format(
                     query=query
                 ),
-                reply_parameters=reply_to(
+                reply_parameters=reply_params(
                     message
                 ),
             )
 
             await add_job(
                 message,
-                lambda: youtube_job(
+                lambda: youtube_download(
                     message,
                     query,
                 ),
@@ -658,28 +613,28 @@ async def text_handler(message):
     url = extract_url(text)
 
     if url and not is_telegram_url(url):
-        mode = get_mode(key)
+        mode = user_modes[key]
 
-        status_message = await message.answer(
+        status = await message.answer(
             START_REPLY,
-            reply_parameters=reply_to(
+            reply_parameters=reply_params(
                 message
             ),
         )
 
         accepted = await add_job(
             message,
-            lambda: run_download(
+            lambda: normal_download(
                 message,
                 url,
                 mode,
-                status_message,
+                status,
             ),
         )
 
         if not accepted:
             try:
-                await status_message.delete()
+                await status.delete()
             except Exception:
                 pass
 
@@ -689,7 +644,9 @@ async def text_handler(message):
 
     await message.answer(
         REPLIES[index],
-        reply_parameters=reply_to(message),
+        reply_parameters=reply_params(
+            message
+        ),
     )
 
     reply_indexes[key] = (
