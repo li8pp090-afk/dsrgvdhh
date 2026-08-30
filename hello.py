@@ -35,9 +35,15 @@ DATA_FILE = "id-file.json"
 
 YOUTUBE_PREFIX = "يوت "
 
-URL_FAILED = "الرابط غير مدعوم او الموقع غير مدعوم\nههع شم كسي يلا"
+URL_FAILED = (
+    "الرابط غير مدعوم او الموقع غير مدعوم\n"
+    "ههع شم كسي يلا"
+)
 
-YOUTUBE_FAILED = "المعذرة منك\nماقدرت اوفرلك هذا العنوان"
+YOUTUBE_FAILED = (
+    "المعذرة منك\n"
+    "ماقدرت اوفرلك هذا العنوان"
+)
 
 SPECIAL_LETTERS = set("atgnmfjlu")
 
@@ -49,6 +55,10 @@ REPLIES = (
 
 data_store = {}
 
+
+# =========================
+# DATA
+# =========================
 
 def load_data():
     global data_store
@@ -140,6 +150,10 @@ def get_user_reply_data(chat_id, user_id):
     return chat_data["reply_users"][user_key]
 
 
+# =========================
+# SETTINGS
+# =========================
+
 def build_mode_keyboard(mode):
     voice_style = (
         "primary"
@@ -217,6 +231,10 @@ async def send_settings(
     save_data()
 
 
+# =========================
+# OWNER
+# =========================
+
 async def is_owner(
     chat_id,
     user_id,
@@ -233,6 +251,10 @@ async def is_owner(
         return False
 
 
+# =========================
+# URL
+# =========================
+
 def extract_urls(text):
     if not text:
         return []
@@ -244,10 +266,9 @@ def extract_urls(text):
             "()[]{}<>\"'"
         )
 
-        if word.startswith(
-            "http://"
-        ) or word.startswith(
-            "https://"
+        if (
+            word.startswith("http://")
+            or word.startswith("https://")
         ):
             result.append(word)
 
@@ -266,97 +287,23 @@ def normalize_text(text):
     return text.strip()
 
 
-def tokens(text):
-    return set(
-        re.findall(
-            r"[a-z0-9\u0600-\u06ff]+",
-            normalize_text(text),
-        )
-    )
+# =========================
+# YOUTUBE
+# =========================
 
-
-def title_match(
-    query,
-    title,
-):
-    q = tokens(query)
-    t = tokens(title)
-
-    if not q:
-        return 0
-
-    matched = len(q & t)
-
-    return matched / len(q)
-
-
-def popularity_score(info):
-    views = info.get(
-        "view_count"
-    ) or 0
-
-    likes = info.get(
-        "like_count"
-    ) or 0
-
-    comments = info.get(
-        "comment_count"
-    ) or 0
+def popularity_key(info):
+    views = info.get("view_count") or 0
+    likes = info.get("like_count") or 0
+    comments = info.get("comment_count") or 0
 
     return (
-        min(views / 10_000_000, 1)
-        * 0.65
-        +
-        min(likes / 500_000, 1)
-        * 0.25
-        +
-        min(comments / 100_000, 1)
-        * 0.10
+        views,
+        likes,
+        comments,
     )
 
 
-def youtube_score(
-    query,
-    info,
-):
-    title = info.get(
-        "title",
-        "",
-    )
-
-    match = title_match(
-        query,
-        title,
-    )
-
-    popularity = popularity_score(
-        info
-    )
-
-    exact = (
-        normalize_text(query)
-        == normalize_text(title)
-    )
-
-    bonus = (
-        0.30
-        if exact
-        else 0
-    )
-
-    return (
-        match * 0.70
-        +
-        popularity * 0.30
-        +
-        bonus
-    )
-
-
-def select_youtube_result(
-    query,
-    results,
-):
+def select_youtube_result(results):
     valid = [
         item
         for item in results
@@ -368,20 +315,14 @@ def select_youtube_result(
         return None
 
     valid.sort(
-        key=lambda x:
-        youtube_score(
-            query,
-            x,
-        ),
+        key=popularity_key,
         reverse=True,
     )
 
     return valid[0]
 
 
-def format_reply_title(
-    title,
-):
+def format_reply_title(title):
     result = title.lower()
 
     for char in SPECIAL_LETTERS:
@@ -393,28 +334,22 @@ def format_reply_title(
     return result
 
 
-async def youtube_search(
-    query,
-):
+async def youtube_search(query):
     def search():
         options = {
             "quiet": True,
             "no_warnings": True,
-            "extract_flat": True,
+            "extract_flat": False,
+            "noplaylist": True,
         }
 
-        with YoutubeDL(
-            options
-        ) as ydl:
+        with YoutubeDL(options) as ydl:
             result = ydl.extract_info(
-                f"ytsearch10:{query}",
+                f"ytsearch20:{query}",
                 download=False,
             )
 
-        return (
-            result.get("entries")
-            or []
-        )
+        return result.get("entries") or []
 
     try:
         results = await asyncio.to_thread(
@@ -422,13 +357,16 @@ async def youtube_search(
         )
 
         return select_youtube_result(
-            query,
-            results,
+            results
         )
 
     except Exception:
         return None
 
+
+# =========================
+# MIME
+# =========================
 
 def get_mime(path):
     try:
@@ -457,33 +395,33 @@ def get_mime(path):
 def media_type(path):
     mime = get_mime(path)
 
-    if mime.startswith(
-        "image/"
-    ):
+    if mime.startswith("image/"):
         return "image"
 
-    if mime.startswith(
-        "video/"
-    ):
+    if mime.startswith("video/"):
         return "video"
 
-    if mime.startswith(
-        "audio/"
-    ):
+    if mime.startswith("audio/"):
         return "audio"
 
     return "document"
 
 
+# =========================
+# FILES
+# =========================
+
 def files_in(directory):
     return [
         p
-        for p in Path(
-            directory
-        ).rglob("*")
+        for p in Path(directory).rglob("*")
         if p.is_file()
     ]
 
+
+# =========================
+# YT-DLP INFO
+# =========================
 
 def inspect_url(url):
     options = {
@@ -492,9 +430,7 @@ def inspect_url(url):
         "skip_download": True,
     }
 
-    with YoutubeDL(
-        options
-    ) as ydl:
+    with YoutubeDL(options) as ydl:
         return ydl.extract_info(
             url,
             download=False,
@@ -511,21 +447,21 @@ async def get_info(url):
         return None
 
 
+# =========================
+# FORMAT SELECTION
+# =========================
+
 def best_audio(info):
-    formats = info.get(
-        "formats"
-    ) or []
+    formats = info.get("formats") or []
 
     audio = [
         f
         for f in formats
         if f.get("acodec")
-        and f.get("acodec")
-        != "none"
+        and f.get("acodec") != "none"
         and (
             not f.get("vcodec")
-            or f.get("vcodec")
-            == "none"
+            or f.get("vcodec") == "none"
         )
     ]
 
@@ -545,31 +481,25 @@ def best_audio(info):
 
 
 def best_video(info):
-    formats = info.get(
-        "formats"
-    ) or []
+    formats = info.get("formats") or []
 
     combined = [
         f
         for f in formats
         if f.get("vcodec")
-        and f.get("vcodec")
-        != "none"
+        and f.get("vcodec") != "none"
         and f.get("acodec")
-        and f.get("acodec")
-        != "none"
+        and f.get("acodec") != "none"
     ]
 
     separate = [
         f
         for f in formats
         if f.get("vcodec")
-        and f.get("vcodec")
-        != "none"
+        and f.get("vcodec") != "none"
         and (
             not f.get("acodec")
-            or f.get("acodec")
-            == "none"
+            or f.get("acodec") == "none"
         )
     ]
 
@@ -592,24 +522,19 @@ def best_video(info):
     )
 
     if combined:
-        return (
-            combined[0],
-            None,
-        )
+        return combined[0], None
 
     audio = best_audio(info)
 
     if separate and audio:
-        return (
-            separate[0],
-            audio,
-        )
+        return separate[0], audio
 
-    return (
-        None,
-        None,
-    )
+    return None, None
 
+
+# =========================
+# DOWNLOAD
+# =========================
 
 def download(
     url,
@@ -627,35 +552,37 @@ def download(
         "outtmpl": output,
         "quiet": True,
         "no_warnings": True,
+        "noplaylist": False,
     }
 
     if progress_hook:
-        options[
-            "progress_hooks"
-        ] = [
+        options["progress_hooks"] = [
             progress_hook
         ]
 
-    with YoutubeDL(
-        options
-    ) as ydl:
+    with YoutubeDL(options) as ydl:
         return ydl.extract_info(
             url,
             download=True,
         )
 
 
+# =========================
+# PROGRESS
+# =========================
+
 async def update_progress(
     progress_message,
     value,
 ):
-    value = (
-        int(value / 25)
-        * 25
+    value = max(
+        0,
+        min(100, value),
     )
 
-    if value > 100:
-        value = 100
+    value = (
+        value // 25
+    ) * 25
 
     try:
         await progress_message.edit_text(
@@ -665,43 +592,33 @@ async def update_progress(
         pass
 
 
-def progress_hook(
+def make_progress_hook(
     progress_message,
+    loop,
 ):
     state = {
         "value": -1,
     }
 
-    loop = asyncio.get_running_loop()
-
     def hook(status):
-        if status.get(
-            "status"
-        ) != "downloading":
+        if status.get("status") != "downloading":
             return
 
         total = (
-            status.get(
-                "total_bytes"
-            )
-            or
-            status.get(
-                "total_bytes_estimate"
-            )
+            status.get("total_bytes")
+            or status.get("total_bytes_estimate")
         )
 
-        downloaded = status.get(
-            "downloaded_bytes",
-            0,
+        downloaded = (
+            status.get("downloaded_bytes")
+            or 0
         )
 
         if not total:
             return
 
         percent = int(
-            downloaded
-            * 100
-            / total
+            downloaded * 100 / total
         )
 
         percent = (
@@ -724,27 +641,30 @@ def progress_hook(
     return hook
 
 
+# =========================
+# AUDIO
+# =========================
+
 async def download_audio(
     url,
     directory,
     progress_message,
 ):
-    info = await get_info(
-        url
-    )
+    info = await get_info(url)
 
     if not info:
         return []
 
-    audio = best_audio(
-        info
-    )
+    audio = best_audio(info)
 
     if not audio:
         return []
 
-    hook = progress_hook(
-        progress_message
+    loop = asyncio.get_running_loop()
+
+    hook = make_progress_hook(
+        progress_message,
+        loop,
     )
 
     try:
@@ -758,26 +678,24 @@ async def download_audio(
     except Exception:
         return []
 
-    return files_in(
-        directory
-    )
+    return files_in(directory)
 
+
+# =========================
+# VIDEO
+# =========================
 
 async def download_video(
     url,
     directory,
     progress_message,
 ):
-    info = await get_info(
-        url
-    )
+    info = await get_info(url)
 
     if not info:
         return []
 
-    video, audio = best_video(
-        info
-    )
+    video, audio = best_video(info)
 
     if not video:
         return []
@@ -788,12 +706,13 @@ async def download_video(
             f'{audio["format_id"]}'
         )
     else:
-        selector = video[
-            "format_id"
-        ]
+        selector = video["format_id"]
 
-    hook = progress_hook(
-        progress_message
+    loop = asyncio.get_running_loop()
+
+    hook = make_progress_hook(
+        progress_message,
+        loop,
     )
 
     try:
@@ -807,10 +726,12 @@ async def download_video(
     except Exception:
         return []
 
-    return files_in(
-        directory
-    )
+    return files_in(directory)
 
+
+# =========================
+# VOICE
+# =========================
 
 async def convert_voice(
     source,
@@ -835,9 +756,7 @@ async def convert_voice(
 
     return (
         process.returncode == 0
-        and os.path.exists(
-            destination
-        )
+        and os.path.exists(destination)
     )
 
 
@@ -858,93 +777,91 @@ async def send_voice(
             return None
 
         return await message.reply_voice(
-            FSInputFile(
-                destination
-            )
+            FSInputFile(destination)
         )
 
+
+# =========================
+# MEDIA
+# =========================
 
 async def send_media(
     message,
     files,
 ):
-    images = [
+    media = [
         f
         for f in files
         if media_type(f)
-        == "image"
+        in {"image", "video"}
     ]
-
-    videos = [
-        f
-        for f in files
-        if media_type(f)
-        == "video"
-    ]
-
-    media = images + videos
 
     if not media:
         return False
 
     if len(media) == 1:
-        if media_type(
-            media[0]
-        ) == "image":
+        path = media[0]
+
+        if media_type(path) == "image":
             await message.reply_photo(
-                FSInputFile(
-                    media[0]
-                )
+                FSInputFile(path)
             )
         else:
             await message.reply_video(
-                FSInputFile(
-                    media[0]
-                )
+                FSInputFile(path)
             )
 
         return True
 
-    for start in range(
-        0,
-        len(media),
-        10,
-    ):
-        batch = media[
-            start:start + 10
-        ]
+    batches = [
+        media[i:i + 10]
+        for i in range(
+            0,
+            len(media),
+            10,
+        )
+    ]
 
+    previous_message_ids = []
+
+    for index, batch in enumerate(batches):
         telegram_media = []
 
         for path in batch:
-            if (
-                media_type(path)
-                == "image"
-            ):
+            if media_type(path) == "image":
                 telegram_media.append(
                     InputMediaPhoto(
-                        media=FSInputFile(
-                            path
-                        )
+                        media=FSInputFile(path)
                     )
                 )
             else:
                 telegram_media.append(
                     InputMediaVideo(
-                        media=FSInputFile(
-                            path
-                        )
+                        media=FSInputFile(path)
                     )
                 )
 
-        await bot.send_media_group(
+        sent = await bot.send_media_group(
             chat_id=message.chat.id,
             media=telegram_media,
-            reply_to_message_id=message.message_id,
+            reply_to_message_id=(
+                message.message_id
+                if index == 0
+                else previous_message_ids[-1]
+            ),
         )
+
+        if sent:
+            previous_message_ids.append(
+                sent[-1].message_id
+            )
 
     return True
 
+
+# =========================
+# URL PROCESSING
+# =========================
 
 async def process_url(
     message,
@@ -956,6 +873,7 @@ async def process_url(
     )
 
     with tempfile.TemporaryDirectory() as d:
+
         if mode == "voice":
             files = await download_audio(
                 url,
@@ -970,26 +888,36 @@ async def process_url(
             )
 
         if not files:
-            await progress.edit_text(
-                URL_FAILED
-            )
-            return
+            try:
+                await progress.edit_text(
+                    URL_FAILED
+                )
+            except Exception:
+                pass
 
-        try:
-            await progress.delete()
-        except Exception:
-            pass
+            return
 
         if mode == "voice":
             audio = [
                 f
                 for f in files
-                if media_type(f)
-                == "audio"
+                if media_type(f) == "audio"
             ]
 
             if not audio:
+                try:
+                    await progress.edit_text(
+                        URL_FAILED
+                    )
+                except Exception:
+                    pass
+
                 return
+
+            try:
+                await progress.delete()
+            except Exception:
+                pass
 
             await send_voice(
                 message,
@@ -998,11 +926,37 @@ async def process_url(
 
             return
 
+        media = [
+            f
+            for f in files
+            if media_type(f)
+            in {"image", "video"}
+        ]
+
+        if not media:
+            try:
+                await progress.edit_text(
+                    URL_FAILED
+                )
+            except Exception:
+                pass
+
+            return
+
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+
         await send_media(
             message,
-            files,
+            media,
         )
 
+
+# =========================
+# YOUTUBE PROCESSING
+# =========================
 
 async def process_youtube(
     message,
@@ -1018,9 +972,10 @@ async def process_youtube(
         )
         return
 
-    title = result.get(
-        "title"
-    ) or query
+    title = (
+        result.get("title")
+        or query
+    )
 
     reply_title = format_reply_title(
         title
@@ -1031,25 +986,22 @@ async def process_youtube(
         "تدلل عبي 🍧"
     )
 
-    url = (
-        result.get(
-            "webpage_url"
-        )
-        or result.get(
-            "url"
-        )
-    )
+    video_id = result.get("id")
 
-    if not url:
+    if not video_id:
         await result_message.edit_text(
             YOUTUBE_FAILED
         )
         return
 
+    url = (
+        result.get("webpage_url")
+        or f"https://www.youtube.com/watch?v={video_id}"
+    )
+
     with tempfile.TemporaryDirectory() as d:
-        info = await get_info(
-            url
-        )
+
+        info = await get_info(url)
 
         if not info:
             await result_message.edit_text(
@@ -1057,9 +1009,7 @@ async def process_youtube(
             )
             return
 
-        audio = best_audio(
-            info
-        )
+        audio = best_audio(info)
 
         if not audio:
             await result_message.edit_text(
@@ -1080,15 +1030,12 @@ async def process_youtube(
             )
             return
 
-        files = files_in(
-            d
-        )
+        files = files_in(d)
 
         audio_files = [
             f
             for f in files
-            if media_type(f)
-            == "audio"
+            if media_type(f) == "audio"
         ]
 
         if not audio_files:
@@ -1098,6 +1045,7 @@ async def process_youtube(
             return
 
         with tempfile.TemporaryDirectory() as vd:
+
             voice_path = os.path.join(
                 vd,
                 "voice.ogg",
@@ -1112,15 +1060,24 @@ async def process_youtube(
                 )
                 return
 
-            await result_message.delete()
+            try:
+                await result_message.delete()
+            except Exception:
+                pass
 
-            await message.reply_voice(
-                FSInputFile(
-                    voice_path
-                ),
-                reply_to_message_id=message.message_id,
-            )
+            try:
+                await message.reply_voice(
+                    FSInputFile(voice_path)
+                )
+            except Exception:
+                await message.reply(
+                    YOUTUBE_FAILED
+                )
 
+
+# =========================
+# PRIVATE
+# =========================
 
 @router.message()
 async def message_handler(
@@ -1132,13 +1089,9 @@ async def message_handler(
         else ""
     )
 
-    if (
-        message.chat.type
-        == ChatType.PRIVATE
-    ):
-        user_id = (
-            message.from_user.id
-        )
+    if message.chat.type == ChatType.PRIVATE:
+
+        user_id = message.from_user.id
 
         private = get_private_data(
             user_id
@@ -1167,9 +1120,7 @@ async def message_handler(
 
             return
 
-        urls = extract_urls(
-            text
-        )
+        urls = extract_urls(text)
 
         if urls:
             for url in urls:
@@ -1196,25 +1147,31 @@ async def message_handler(
         ) % len(REPLIES)
 
         save_data()
+
         return
+
+
+    # =====================
+    # GROUP / SUPERGROUP
+    # =====================
 
     if message.chat.type in {
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     }:
+
         if not message.from_user:
             return
 
         chat_id = message.chat.id
-        user_id = (
-            message.from_user.id
-        )
+        user_id = message.from_user.id
 
         chat = get_chat_data(
             chat_id
         )
 
         if text == "ادت":
+
             if await is_owner(
                 chat_id,
                 user_id,
@@ -1228,13 +1185,12 @@ async def message_handler(
             return
 
         if text == "تعطيل":
+
             if await is_owner(
                 chat_id,
                 user_id,
             ):
-                chat[
-                    "disabled"
-                ] = True
+                chat["disabled"] = True
 
                 save_data()
 
@@ -1246,13 +1202,12 @@ async def message_handler(
             return
 
         if text == "تفعيل":
+
             if await is_owner(
                 chat_id,
                 user_id,
             ):
-                chat[
-                    "disabled"
-                ] = False
+                chat["disabled"] = False
 
                 save_data()
 
@@ -1263,12 +1218,11 @@ async def message_handler(
 
             return
 
-        if chat[
-            "disabled"
-        ]:
+        if chat["disabled"]:
             return
 
         if text == "بوت":
+
             user_data = get_user_reply_data(
                 chat_id,
                 user_id,
@@ -1289,11 +1243,25 @@ async def message_handler(
             ) % len(REPLIES)
 
             save_data()
+
             return
 
-        urls = extract_urls(
-            text
-        )
+        if text.startswith(
+            YOUTUBE_PREFIX
+        ):
+            query = text[
+                len(YOUTUBE_PREFIX):
+            ].strip()
+
+            if query:
+                await process_youtube(
+                    message,
+                    query,
+                )
+
+            return
+
+        urls = extract_urls(text)
 
         if urls:
             for url in urls:
@@ -1307,41 +1275,24 @@ async def message_handler(
 
         return
 
-    if (
-        message.chat.type
-        == ChatType.CHANNEL
-    ):
+
+    # =====================
+    # CHANNEL
+    # =====================
+
+    if message.chat.type == ChatType.CHANNEL:
+
         chat_id = message.chat.id
+
         chat = get_chat_data(
             chat_id
         )
 
-        if chat[
-            "disabled"
-        ]:
-            return
-
-        if text == "ادت":
-            user_id = (
-                message.from_user.id
-                if message.from_user
-                else None
-            )
-
-            if user_id is not None:
-                if await is_owner(
-                    chat_id,
-                    user_id,
-                ):
-                    await send_settings(
-                        message,
-                        chat["mode"],
-                        chat,
-                    )
-
+        if chat["disabled"]:
             return
 
         if text == "بوت":
+
             user_id = (
                 message.from_user.id
                 if message.from_user
@@ -1368,11 +1319,25 @@ async def message_handler(
             ) % len(REPLIES)
 
             save_data()
+
             return
 
-        urls = extract_urls(
-            text
-        )
+        if text.startswith(
+            YOUTUBE_PREFIX
+        ):
+            query = text[
+                len(YOUTUBE_PREFIX):
+            ].strip()
+
+            if query:
+                await process_youtube(
+                    message,
+                    query,
+                )
+
+            return
+
+        urls = extract_urls(text)
 
         if urls:
             for url in urls:
@@ -1382,6 +1347,10 @@ async def message_handler(
                     chat["mode"],
                 )
 
+
+# =========================
+# CALLBACKS
+# =========================
 
 @router.callback_query(
     lambda c:
@@ -1393,6 +1362,7 @@ async def message_handler(
 async def mode_callback(
     callback: CallbackQuery,
 ):
+
     if not callback.message:
         return
 
@@ -1404,10 +1374,8 @@ async def mode_callback(
         1,
     )[1]
 
-    if (
-        chat.type
-        == ChatType.PRIVATE
-    ):
+    if chat.type == ChatType.PRIVATE:
+
         owner_data = get_private_data(
             user_id
         )
@@ -1416,6 +1384,7 @@ async def mode_callback(
         ChatType.GROUP,
         ChatType.SUPERGROUP,
     }:
+
         if not await is_owner(
             chat.id,
             user_id,
@@ -1435,9 +1404,7 @@ async def mode_callback(
         await callback.answer()
         return
 
-    current = owner_data[
-        "mode"
-    ]
+    current = owner_data["mode"]
 
     if (
         current == "default"
@@ -1454,13 +1421,9 @@ async def mode_callback(
         current == "voice"
         and selected == "voice"
     ):
-        owner_data[
-            "mode"
-        ] = "default"
+        owner_data["mode"] = "default"
     else:
-        owner_data[
-            "mode"
-        ] = selected
+        owner_data["mode"] = selected
 
     await callback.message.edit_reply_markup(
         reply_markup=build_mode_keyboard(
@@ -1476,6 +1439,10 @@ async def mode_callback(
 
     await callback.answer()
 
+
+# =========================
+# MAIN
+# =========================
 
 async def main():
     await dp.start_polling(
