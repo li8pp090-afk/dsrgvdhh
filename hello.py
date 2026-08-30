@@ -26,6 +26,7 @@ if not TOKEN:
 bot = Bot(TOKEN)
 dp = Dispatcher()
 router = Router()
+
 dp.include_router(router)
 
 DATA_FILE = "id-file.json"
@@ -82,8 +83,8 @@ def chat_key(chat_id):
     return f"chat:{chat_id}"
 
 
-def cache_key(url):
-    return f"cache:{url}"
+def cache_key(url, mode):
+    return f"cache:{mode}:{url}"
 
 
 def get_private_data(user_id):
@@ -125,18 +126,32 @@ def get_user_reply_data(chat_id, user_id):
     return chat_data["reply_users"][user_key]
 
 
-def get_cached(url):
-    return data_store.get(cache_key(url))
+def get_cached(url, mode):
+    return data_store.get(
+        cache_key(url, mode)
+    )
 
 
-def save_cached(url, value):
-    data_store[cache_key(url)] = value
+def save_cached(url, mode, value):
+    data_store[
+        cache_key(url, mode)
+    ] = value
+
     save_data()
 
 
 def build_mode_keyboard(mode):
-    voice_style = "primary" if mode == "voice" else "danger"
-    default_style = "primary" if mode == "default" else "danger"
+    voice_style = (
+        "primary"
+        if mode == "voice"
+        else "danger"
+    )
+
+    default_style = (
+        "primary"
+        if mode == "default"
+        else "danger"
+    )
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -156,7 +171,10 @@ def build_mode_keyboard(mode):
     )
 
 
-async def delete_previous_settings(chat_id, message_id):
+async def delete_previous_settings(
+    chat_id,
+    message_id,
+):
     if not message_id:
         return
 
@@ -169,8 +187,14 @@ async def delete_previous_settings(chat_id, message_id):
         pass
 
 
-async def send_settings(message, mode, owner_data):
-    old_message_id = owner_data.get("last_settings_message")
+async def send_settings(
+    message,
+    mode,
+    owner_data,
+):
+    old_message_id = owner_data.get(
+        "last_settings_message"
+    )
 
     if old_message_id:
         await delete_previous_settings(
@@ -180,14 +204,22 @@ async def send_settings(message, mode, owner_data):
 
     settings_message = await message.reply(
         "تستطيع تغيير وضع عمل البوت\nمن هنا",
-        reply_markup=build_mode_keyboard(mode),
+        reply_markup=build_mode_keyboard(
+            mode
+        ),
     )
 
-    owner_data["last_settings_message"] = settings_message.message_id
+    owner_data[
+        "last_settings_message"
+    ] = settings_message.message_id
+
     save_data()
 
 
-async def is_owner(chat_id, user_id):
+async def is_owner(
+    chat_id,
+    user_id,
+):
     try:
         member = await bot.get_chat_member(
             chat_id,
@@ -207,9 +239,14 @@ def extract_urls(text):
     result = []
 
     for word in text.split():
-        word = word.strip("()[]{}<>\"'")
+        word = word.strip(
+            "()[]{}<>\"'"
+        )
 
-        if word.startswith("http://") or word.startswith("https://"):
+        if (
+            word.startswith("http://")
+            or word.startswith("https://")
+        ):
             result.append(word)
 
     return result
@@ -307,55 +344,111 @@ def download_sync(
         )
 
 
-def choose_default_format(info):
-    formats = info.get("formats") or []
+def choose_video_format(info):
+    formats = info.get(
+        "formats"
+    ) or []
 
-    has_video = any(
-        f.get("vcodec")
+    video_formats = [
+        f
+        for f in formats
+        if f.get("vcodec")
         and f.get("vcodec") != "none"
-        for f in formats
+    ]
+
+    if not video_formats:
+        return "best"
+
+    video_formats.sort(
+        key=lambda f: (
+            f.get("height") or 0,
+            f.get("fps") or 0,
+            f.get("tbr") or 0,
+            f.get("filesize") or 0,
+        ),
+        reverse=True,
     )
 
-    has_audio = any(
-        f.get("acodec")
-        and f.get("acodec") != "none"
+    best_video = video_formats[0]
+
+    if (
+        best_video.get("acodec")
+        and best_video.get("acodec") != "none"
+    ):
+        return best_video["format_id"]
+
+    audio_formats = [
+        f
         for f in formats
-    )
+        if (
+            f.get("acodec")
+            and f.get("acodec") != "none"
+            and (
+                not f.get("vcodec")
+                or f.get("vcodec") == "none"
+            )
+        )
+    ]
 
-    if has_video and has_audio:
-        return "bestvideo*+bestaudio/best"
+    if audio_formats:
+        audio_formats.sort(
+            key=lambda f: (
+                f.get("abr") or 0,
+                f.get("tbr") or 0,
+                f.get("filesize") or 0,
+            ),
+            reverse=True,
+        )
 
-    if has_video:
-        return "bestvideo"
+        return (
+            f'{best_video["format_id"]}+'
+            f'{audio_formats[0]["format_id"]}'
+        )
 
-    if has_audio:
-        return "bestaudio"
-
-    return "best"
+    return best_video["format_id"]
 
 
 def choose_audio_format(info):
-    formats = info.get("formats") or []
+    formats = info.get(
+        "formats"
+    ) or []
 
-    has_audio = any(
-        f.get("acodec")
-        and f.get("acodec") != "none"
+    audio_formats = [
+        f
         for f in formats
+        if (
+            f.get("acodec")
+            and f.get("acodec") != "none"
+        )
+    ]
+
+    if not audio_formats:
+        return "bestaudio/best"
+
+    audio_formats.sort(
+        key=lambda f: (
+            f.get("abr") or 0,
+            f.get("tbr") or 0,
+            f.get("filesize") or 0,
+        ),
+        reverse=True,
     )
 
-    if has_audio:
-        return "bestaudio"
-
-    return "best"
+    return audio_formats[0]["format_id"]
 
 
-async def download_default(url, directory):
+async def download_default(
+    url,
+    directory,
+):
     info = await get_info(url)
 
     if not info:
         return []
 
-    selector = choose_default_format(info)
+    selector = choose_video_format(
+        info
+    )
 
     try:
         await asyncio.to_thread(
@@ -370,13 +463,18 @@ async def download_default(url, directory):
     return files_in(directory)
 
 
-async def download_audio(url, directory):
+async def download_audio(
+    url,
+    directory,
+):
     info = await get_info(url)
 
     if not info:
         return []
 
-    selector = choose_audio_format(info)
+    selector = choose_audio_format(
+        info
+    )
 
     try:
         await asyncio.to_thread(
@@ -391,20 +489,27 @@ async def download_audio(url, directory):
     return files_in(directory)
 
 
-async def convert_voice(source, destination):
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source),
-        "-vn",
-        "-c:a",
-        "libopus",
-        "-f",
-        "ogg",
-        destination,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
+async def convert_voice(
+    source,
+    destination,
+):
+    process = (
+        await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "128k",
+            "-f",
+            "ogg",
+            destination,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
     )
 
     await process.communicate()
@@ -415,7 +520,10 @@ async def convert_voice(source, destination):
     )
 
 
-async def send_voice_file(message, path):
+async def send_voice_file(
+    message,
+    path,
+):
     with tempfile.TemporaryDirectory() as directory:
         destination = os.path.join(
             directory,
@@ -429,7 +537,9 @@ async def send_voice_file(message, path):
             return None
 
         sent = await message.reply_voice(
-            FSInputFile(destination)
+            voice=FSInputFile(
+                destination
+            )
         )
 
         return {
@@ -438,9 +548,13 @@ async def send_voice_file(message, path):
         }
 
 
-async def send_video_file(message, path):
+async def send_video_file(
+    message,
+    path,
+):
     sent = await message.reply_video(
-        FSInputFile(path)
+        video=FSInputFile(path),
+        supports_streaming=True,
     )
 
     return {
@@ -449,9 +563,12 @@ async def send_video_file(message, path):
     }
 
 
-async def send_photo_file(message, path):
+async def send_photo_file(
+    message,
+    path,
+):
     sent = await message.reply_photo(
-        FSInputFile(path)
+        photo=FSInputFile(path)
     )
 
     return {
@@ -460,9 +577,12 @@ async def send_photo_file(message, path):
     }
 
 
-async def send_document_file(message, path):
+async def send_document_file(
+    message,
+    path,
+):
     sent = await message.reply_document(
-        FSInputFile(path)
+        document=FSInputFile(path)
     )
 
     return {
@@ -471,7 +591,10 @@ async def send_document_file(message, path):
     }
 
 
-async def send_album(message, files):
+async def send_album(
+    message,
+    files,
+):
     media_files = [
         f
         for f in files
@@ -485,54 +608,70 @@ async def send_album(message, files):
         return None
 
     if len(media_files) == 1:
-        if media_type(media_files[0]) == "image":
+        kind = media_type(
+            media_files[0]
+        )
+
+        if kind == "image":
             return await send_photo_file(
                 message,
                 media_files[0],
             )
 
-        return await send_video_file(
-            message,
-            media_files[0],
-        )
+        if kind == "video":
+            return await send_video_file(
+                message,
+                media_files[0],
+            )
 
     cached_items = []
-    previous_message_id = message.message_id
+    reply_id = message.message_id
 
-    for start in range(0, len(media_files), 10):
-        batch = media_files[start:start + 10]
-        telegram_media = []
+    for start in range(
+        0,
+        len(media_files),
+        10,
+    ):
+        batch = media_files[
+            start:start + 10
+        ]
+
+        media = []
 
         for path in batch:
             kind = media_type(path)
 
             if kind == "image":
-                telegram_media.append(
+                media.append(
                     InputMediaPhoto(
-                        media=FSInputFile(path)
+                        media=FSInputFile(
+                            path
+                        )
                     )
                 )
 
             elif kind == "video":
-                telegram_media.append(
+                media.append(
                     InputMediaVideo(
-                        media=FSInputFile(path)
+                        media=FSInputFile(
+                            path
+                        )
                     )
                 )
 
-        if not telegram_media:
+        if not media:
             continue
 
         sent = await bot.send_media_group(
             chat_id=message.chat.id,
-            media=telegram_media,
-            reply_to_message_id=previous_message_id,
+            media=media,
+            reply_to_message_id=reply_id,
         )
 
         if not sent:
             continue
 
-        previous_message_id = sent[-1].message_id
+        reply_id = sent[-1].message_id
 
         for item in sent:
             if item.photo:
@@ -560,47 +699,62 @@ async def send_album(message, files):
     }
 
 
-async def send_cached(message, cached):
+async def send_cached(
+    message,
+    cached,
+):
     if not cached:
         return False
 
     try:
-        kind = cached.get("type")
+        kind = cached.get(
+            "type"
+        )
 
         if kind == "voice":
             await message.reply_voice(
-                cached["file_id"]
+                voice=cached["file_id"]
             )
             return True
 
         if kind == "video":
             await message.reply_video(
-                cached["file_id"]
+                video=cached["file_id"],
+                supports_streaming=True,
             )
             return True
 
         if kind == "photo":
             await message.reply_photo(
-                cached["file_id"]
+                photo=cached["file_id"]
             )
             return True
 
         if kind == "document":
             await message.reply_document(
-                cached["file_id"]
+                document=cached["file_id"]
             )
             return True
 
         if kind == "album":
-            items = cached.get("items") or []
+            items = cached.get(
+                "items"
+            ) or []
 
             if not items:
                 return False
 
-            previous_message_id = message.message_id
+            reply_id = message.message_id
 
-            for start in range(0, len(items), 10):
-                batch = items[start:start + 10]
+            for start in range(
+                0,
+                len(items),
+                10,
+            ):
+                batch = items[
+                    start:start + 10
+                ]
+
                 media = []
 
                 for item in batch:
@@ -624,11 +778,11 @@ async def send_cached(message, cached):
                 sent = await bot.send_media_group(
                     chat_id=message.chat.id,
                     media=media,
-                    reply_to_message_id=previous_message_id,
+                    reply_to_message_id=reply_id,
                 )
 
                 if sent:
-                    previous_message_id = sent[-1].message_id
+                    reply_id = sent[-1].message_id
 
             return True
 
@@ -638,15 +792,27 @@ async def send_cached(message, cached):
     return False
 
 
-def get_lock(url):
-    if url not in download_locks:
-        download_locks[url] = asyncio.Lock()
+def get_lock(
+    url,
+    mode,
+):
+    key = f"{mode}:{url}"
 
-    return download_locks[url]
+    if key not in download_locks:
+        download_locks[key] = asyncio.Lock()
+
+    return download_locks[key]
 
 
-async def process_url(message, url, mode):
-    cached = get_cached(url)
+async def process_url(
+    message,
+    url,
+    mode,
+):
+    cached = get_cached(
+        url,
+        mode,
+    )
 
     if cached:
         if await send_cached(
@@ -655,8 +821,14 @@ async def process_url(message, url, mode):
         ):
             return
 
-    async with get_lock(url):
-        cached = get_cached(url)
+    async with get_lock(
+        url,
+        mode,
+    ):
+        cached = get_cached(
+            url,
+            mode,
+        )
 
         if cached:
             if await send_cached(
@@ -669,124 +841,150 @@ async def process_url(message, url, mode):
             URL_PROGRESS
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            info = await get_info(url)
-
-            if not info:
-                try:
-                    await progress.edit_text(
-                        URL_FAILED
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                if mode == "voice":
+                    files = await download_audio(
+                        url,
+                        directory,
                     )
-                except Exception:
-                    pass
-
-                return
-
-            if mode == "voice":
-                files = await download_audio(
-                    url,
-                    directory,
-                )
-            else:
-                files = await download_default(
-                    url,
-                    directory,
-                )
-
-            if not files:
-                try:
-                    await progress.edit_text(
-                        URL_FAILED
+                else:
+                    files = await download_default(
+                        url,
+                        directory,
                     )
-                except Exception:
-                    pass
 
-                return
+                if not files:
+                    try:
+                        await progress.edit_text(
+                            URL_FAILED
+                        )
+                    except Exception:
+                        pass
 
-            audio_files = [
-                f
-                for f in files
-                if media_type(f) == "audio"
-            ]
-
-            video_files = [
-                f
-                for f in files
-                if media_type(f) == "video"
-            ]
-
-            image_files = [
-                f
-                for f in files
-                if media_type(f) == "image"
-            ]
-
-            document_files = [
-                f
-                for f in files
-                if media_type(f) == "document"
-            ]
-
-            try:
-                await progress.delete()
-            except Exception:
-                pass
-
-            if audio_files and not video_files and not image_files:
-                result = await send_voice_file(
-                    message,
-                    audio_files[0],
-                )
-
-                if not result:
-                    await message.reply(
-                        URL_FAILED
-                    )
                     return
 
-                save_cached(
-                    url,
-                    result,
-                )
+                audio_files = [
+                    f
+                    for f in files
+                    if media_type(f) == "audio"
+                ]
 
-                return
+                video_files = [
+                    f
+                    for f in files
+                    if media_type(f) == "video"
+                ]
 
-            media_files = image_files + video_files
+                image_files = [
+                    f
+                    for f in files
+                    if media_type(f) == "image"
+                ]
 
-            if media_files:
-                result = await send_album(
-                    message,
-                    media_files,
-                )
+                document_files = [
+                    f
+                    for f in files
+                    if media_type(f) == "document"
+                ]
 
-                if result:
+                try:
+                    await progress.delete()
+                except Exception:
+                    pass
+
+                if mode == "voice":
+                    if not audio_files:
+                        await message.reply(
+                            URL_FAILED
+                        )
+                        return
+
+                    result = await send_voice_file(
+                        message,
+                        audio_files[0],
+                    )
+
+                    if not result:
+                        await message.reply(
+                            URL_FAILED
+                        )
+                        return
+
                     save_cached(
                         url,
+                        mode,
                         result,
                     )
 
                     return
 
-            if document_files:
-                result = await send_document_file(
-                    message,
-                    document_files[0],
+                if video_files:
+                    if len(video_files) == 1:
+                        result = await send_video_file(
+                            message,
+                            video_files[0],
+                        )
+
+                        if result:
+                            save_cached(
+                                url,
+                                mode,
+                                result,
+                            )
+
+                            return
+
+                media_files = (
+                    image_files
+                    + video_files
                 )
 
-                save_cached(
-                    url,
-                    result,
+                if media_files:
+                    result = await send_album(
+                        message,
+                        media_files,
+                    )
+
+                    if result:
+                        save_cached(
+                            url,
+                            mode,
+                            result,
+                        )
+
+                        return
+
+                if document_files:
+                    result = await send_document_file(
+                        message,
+                        document_files[0],
+                    )
+
+                    if result:
+                        save_cached(
+                            url,
+                            mode,
+                            result,
+                        )
+
+                        return
+
+                await message.reply(
+                    URL_FAILED
                 )
 
-                return
-
-            await message.reply(
-                URL_FAILED
-            )
+        finally:
+            try:
+                await progress.delete()
+            except Exception:
+                pass
 
 
 @router.message()
-async def message_handler(message: Message):
+async def message_handler(
+    message: Message,
+):
     text = (
         message.text.strip()
         if message.text
@@ -795,7 +993,10 @@ async def message_handler(message: Message):
 
     if message.chat.type == ChatType.PRIVATE:
         user_id = message.from_user.id
-        private = get_private_data(user_id)
+
+        private = get_private_data(
+            user_id
+        )
 
         if text == "ادت":
             await send_settings(
@@ -817,17 +1018,22 @@ async def message_handler(message: Message):
 
             return
 
-        index = private["reply_index"]
+        index = private[
+            "reply_index"
+        ]
 
         await message.reply(
             REPLIES[index]
         )
 
-        private["reply_index"] = (
+        private[
+            "reply_index"
+        ] = (
             index + 1
         ) % len(REPLIES)
 
         save_data()
+
         return
 
     if message.chat.type in {
@@ -839,7 +1045,10 @@ async def message_handler(message: Message):
 
         chat_id = message.chat.id
         user_id = message.from_user.id
-        chat = get_chat_data(chat_id)
+
+        chat = get_chat_data(
+            chat_id
+        )
 
         if text == "ادت":
             if await is_owner(
@@ -859,7 +1068,10 @@ async def message_handler(message: Message):
                 chat_id,
                 user_id,
             ):
-                chat["disabled"] = True
+                chat[
+                    "disabled"
+                ] = True
+
                 save_data()
 
                 await message.reply(
@@ -874,7 +1086,10 @@ async def message_handler(message: Message):
                 chat_id,
                 user_id,
             ):
-                chat["disabled"] = False
+                chat[
+                    "disabled"
+                ] = False
+
                 save_data()
 
                 await message.reply(
@@ -893,17 +1108,22 @@ async def message_handler(message: Message):
                 user_id,
             )
 
-            index = user_data["reply_index"]
+            index = user_data[
+                "reply_index"
+            ]
 
             await message.reply(
                 REPLIES[index]
             )
 
-            user_data["reply_index"] = (
+            user_data[
+                "reply_index"
+            ] = (
                 index + 1
             ) % len(REPLIES)
 
             save_data()
+
             return
 
         urls = extract_urls(text)
@@ -922,7 +1142,10 @@ async def message_handler(message: Message):
 
     if message.chat.type == ChatType.CHANNEL:
         chat_id = message.chat.id
-        chat = get_chat_data(chat_id)
+
+        chat = get_chat_data(
+            chat_id
+        )
 
         if chat["disabled"]:
             return
@@ -986,7 +1209,9 @@ async def mode_callback(
         await callback.answer()
         return
 
-    current = owner_data["mode"]
+    current = owner_data[
+        "mode"
+    ]
 
     if (
         current == "default"
@@ -1002,9 +1227,13 @@ async def mode_callback(
         current == "voice"
         and selected == "voice"
     ):
-        owner_data["mode"] = "default"
+        owner_data[
+            "mode"
+        ] = "default"
     else:
-        owner_data["mode"] = selected
+        owner_data[
+            "mode"
+        ] = selected
 
     await callback.message.edit_reply_markup(
         reply_markup=build_mode_keyboard(
@@ -1012,9 +1241,9 @@ async def mode_callback(
         )
     )
 
-    owner_data["last_settings_message"] = (
-        callback.message.message_id
-    )
+    owner_data[
+        "last_settings_message"
+    ] = callback.message.message_id
 
     save_data()
 
@@ -1022,7 +1251,9 @@ async def mode_callback(
 
 
 async def main():
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot
+    )
 
 
 if __name__ == "__main__":
