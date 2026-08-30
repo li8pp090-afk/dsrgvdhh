@@ -18,6 +18,7 @@ from aiogram.types import (
 )
 from yt_dlp import YoutubeDL
 
+
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -83,6 +84,10 @@ def chat_key(chat_id):
     return f"chat:{chat_id}"
 
 
+def cache_key(url, mode):
+    return f"cache:{mode}:{url}"
+
+
 def get_private_data(user_id):
     key = private_key(user_id)
 
@@ -122,6 +127,17 @@ def get_user_reply_data(chat_id, user_id):
     return chat_data["reply_users"][user_key]
 
 
+def get_cached(url, mode):
+    return data_store.get(
+        cache_key(url, mode)
+    )
+
+
+def save_cached(url, mode, value):
+    data_store[cache_key(url, mode)] = value
+    save_data()
+
+
 def build_mode_keyboard(mode):
     voice_style = "primary" if mode == "voice" else "danger"
     default_style = "primary" if mode == "default" else "danger"
@@ -158,7 +174,9 @@ async def delete_previous_settings(chat_id, message_id):
 
 
 async def send_settings(message, mode, owner_data):
-    old_message_id = owner_data.get("last_settings_message")
+    old_message_id = owner_data.get(
+        "last_settings_message"
+    )
 
     if old_message_id:
         await delete_previous_settings(
@@ -171,7 +189,9 @@ async def send_settings(message, mode, owner_data):
         reply_markup=build_mode_keyboard(mode),
     )
 
-    owner_data["last_settings_message"] = settings_message.message_id
+    owner_data["last_settings_message"] = (
+        settings_message.message_id
+    )
 
     save_data()
 
@@ -204,11 +224,12 @@ def extract_urls(text):
     return result
 
 
-def inspect_url(url):
+def get_info_sync(url):
     options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "noplaylist": False,
     }
 
     with YoutubeDL(options) as ydl:
@@ -221,7 +242,7 @@ def inspect_url(url):
 async def get_info(url):
     try:
         return await asyncio.to_thread(
-            inspect_url,
+            get_info_sync,
             url,
         )
     except Exception:
@@ -241,15 +262,10 @@ def get_mime(path):
             text=True,
         )
 
-        mime = result.stdout.strip()
-
-        if mime:
-            return mime
+        return result.stdout.strip()
 
     except Exception:
-        pass
-
-    return ""
+        return ""
 
 
 def media_type(path):
@@ -275,88 +291,11 @@ def files_in(directory):
     ]
 
 
-def best_audio(info):
-    formats = info.get("formats") or []
-
-    audio = [
-        f
-        for f in formats
-        if f.get("acodec")
-        and f.get("acodec") != "none"
-        and (
-            not f.get("vcodec")
-            or f.get("vcodec") == "none"
-        )
-    ]
-
-    if not audio:
-        return None
-
-    audio.sort(
-        key=lambda f: (
-            f.get("abr") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
-        reverse=True,
-    )
-
-    return audio[0]
-
-
-def best_video(info):
-    formats = info.get("formats") or []
-
-    combined = [
-        f
-        for f in formats
-        if f.get("vcodec")
-        and f.get("vcodec") != "none"
-        and f.get("acodec")
-        and f.get("acodec") != "none"
-    ]
-
-    separate = [
-        f
-        for f in formats
-        if f.get("vcodec")
-        and f.get("vcodec") != "none"
-        and (
-            not f.get("acodec")
-            or f.get("acodec") == "none"
-        )
-    ]
-
-    combined.sort(
-        key=lambda f: (
-            f.get("height") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
-        reverse=True,
-    )
-
-    separate.sort(
-        key=lambda f: (
-            f.get("height") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
-        reverse=True,
-    )
-
-    if combined:
-        return combined[0], None
-
-    audio = best_audio(info)
-
-    if separate and audio:
-        return separate[0], audio
-
-    return None, None
-
-
-def download(url, directory, selector):
+def download_sync(
+    url,
+    directory,
+    selector,
+):
     output = os.path.join(
         directory,
         "%(playlist_index)05d-%(title)s.%(ext)s",
@@ -367,6 +306,7 @@ def download(url, directory, selector):
         "outtmpl": output,
         "quiet": True,
         "no_warnings": True,
+        "noplaylist": False,
     }
 
     with YoutubeDL(options) as ydl:
@@ -376,23 +316,62 @@ def download(url, directory, selector):
         )
 
 
-async def download_audio(url, directory):
+def choose_default_format(info):
+    formats = info.get("formats") or []
+
+    has_video = any(
+        f.get("vcodec")
+        and f.get("vcodec") != "none"
+        for f in formats
+    )
+
+    has_audio = any(
+        f.get("acodec")
+        and f.get("acodec") != "none"
+        for f in formats
+    )
+
+    if has_video and has_audio:
+        return "bestvideo*+bestaudio/best"
+
+    if has_video:
+        return "bestvideo"
+
+    if has_audio:
+        return "bestaudio"
+
+    return "best"
+
+
+def choose_audio_format(info):
+    formats = info.get("formats") or []
+
+    has_audio = any(
+        f.get("acodec")
+        and f.get("acodec") != "none"
+        for f in formats
+    )
+
+    if has_audio:
+        return "bestaudio"
+
+    return "best"
+
+
+async def download_default(url, directory):
     info = await get_info(url)
 
     if not info:
         return []
 
-    audio = best_audio(info)
-
-    if not audio:
-        return []
+    selector = choose_default_format(info)
 
     try:
         await asyncio.to_thread(
-            download,
+            download_sync,
             url,
             directory,
-            audio["format_id"],
+            selector,
         )
     except Exception:
         return []
@@ -400,28 +379,17 @@ async def download_audio(url, directory):
     return files_in(directory)
 
 
-async def download_video(url, directory):
+async def download_audio(url, directory):
     info = await get_info(url)
 
     if not info:
         return []
 
-    video, audio = best_video(info)
-
-    if not video:
-        return []
-
-    if audio:
-        selector = (
-            f'{video["format_id"]}+'
-            f'{audio["format_id"]}'
-        )
-    else:
-        selector = video["format_id"]
+    selector = choose_audio_format(info)
 
     try:
         await asyncio.to_thread(
-            download,
+            download_sync,
             url,
             directory,
             selector,
@@ -454,26 +422,159 @@ async def convert_voice(source, destination):
     )
 
 
-async def send_voice(message, source):
-    with tempfile.TemporaryDirectory() as d:
+async def send_cached(message, cached):
+    if not cached:
+        return False
+
+    kind = cached.get("type")
+
+    try:
+        if kind == "voice":
+            await message.reply_voice(
+                cached["file_id"]
+            )
+            return True
+
+        if kind == "photo":
+            await message.reply_photo(
+                cached["file_id"]
+            )
+            return True
+
+        if kind == "video":
+            await message.reply_video(
+                cached["file_id"]
+            )
+            return True
+
+        if kind == "audio":
+            await message.reply_audio(
+                cached["file_id"]
+            )
+            return True
+
+        if kind == "document":
+            await message.reply_document(
+                cached["file_id"]
+            )
+            return True
+
+        if kind == "album":
+            items = cached.get("items") or []
+
+            if not items:
+                return False
+
+            previous_message_id = message.message_id
+
+            for start in range(0, len(items), 10):
+                batch = items[start:start + 10]
+                media = []
+
+                for item in batch:
+                    if item["type"] == "photo":
+                        media.append(
+                            InputMediaPhoto(
+                                media=item["file_id"]
+                            )
+                        )
+                    elif item["type"] == "video":
+                        media.append(
+                            InputMediaVideo(
+                                media=item["file_id"]
+                            )
+                        )
+
+                if not media:
+                    continue
+
+                sent = await bot.send_media_group(
+                    chat_id=message.chat.id,
+                    media=media,
+                    reply_to_message_id=previous_message_id,
+                )
+
+                if sent:
+                    previous_message_id = (
+                        sent[-1].message_id
+                    )
+
+            return True
+
+    except Exception:
+        return False
+
+    return False
+
+
+async def send_single_file(message, path):
+    kind = media_type(path)
+
+    if kind == "image":
+        sent = await message.reply_photo(
+            FSInputFile(path)
+        )
+
+        return {
+            "type": "photo",
+            "file_id": sent.photo[-1].file_id,
+        }
+
+    if kind == "video":
+        sent = await message.reply_video(
+            FSInputFile(path)
+        )
+
+        return {
+            "type": "video",
+            "file_id": sent.video.file_id,
+        }
+
+    if kind == "audio":
+        sent = await message.reply_audio(
+            FSInputFile(path)
+        )
+
+        return {
+            "type": "audio",
+            "file_id": sent.audio.file_id,
+        }
+
+    sent = await message.reply_document(
+        FSInputFile(path)
+    )
+
+    return {
+        "type": "document",
+        "file_id": sent.document.file_id,
+    }
+
+
+async def send_voice_file(message, path):
+    with tempfile.TemporaryDirectory() as directory:
         destination = os.path.join(
-            d,
+            directory,
             "voice.ogg",
         )
 
         if not await convert_voice(
-            source,
+            path,
             destination,
         ):
             return None
 
-        return await message.reply_voice(
+        sent = await message.reply_voice(
             FSInputFile(destination)
         )
 
+        return {
+            "type": "voice",
+            "file_id": sent.voice.file_id,
+        }
 
-async def send_media(message, files):
-    media = [
+
+async def send_album(message, files):
+    media_files = [
         f
         for f in files
         if media_type(f) in {
@@ -482,43 +583,42 @@ async def send_media(message, files):
         }
     ]
 
-    if not media:
-        return False
+    if not media_files:
+        return None
 
-    if len(media) == 1:
-        path = media[0]
+    if len(media_files) == 1:
+        return await send_single_file(
+            message,
+            media_files[0],
+        )
 
-        if media_type(path) == "image":
-            await message.reply_photo(
-                FSInputFile(path)
-            )
-        else:
-            await message.reply_video(
-                FSInputFile(path)
-            )
-
-        return True
-
+    cached_items = []
     previous_message_id = message.message_id
 
-    for start in range(0, len(media), 10):
-        batch = media[start:start + 10]
+    for start in range(0, len(media_files), 10):
+        batch = media_files[start:start + 10]
 
         telegram_media = []
 
         for path in batch:
-            if media_type(path) == "image":
+            kind = media_type(path)
+
+            if kind == "image":
                 telegram_media.append(
                     InputMediaPhoto(
                         media=FSInputFile(path)
                     )
                 )
-            else:
+
+            elif kind == "video":
                 telegram_media.append(
                     InputMediaVideo(
                         media=FSInputFile(path)
                     )
                 )
+
+        if not telegram_media:
+            continue
 
         sent = await bot.send_media_group(
             chat_id=message.chat.id,
@@ -526,27 +626,63 @@ async def send_media(message, files):
             reply_to_message_id=previous_message_id,
         )
 
-        if sent:
-            previous_message_id = sent[-1].message_id
+        if not sent:
+            continue
 
-    return True
+        previous_message_id = sent[-1].message_id
+
+        for msg in sent:
+            if msg.photo:
+                cached_items.append(
+                    {
+                        "type": "photo",
+                        "file_id": msg.photo[-1].file_id,
+                    }
+                )
+            elif msg.video:
+                cached_items.append(
+                    {
+                        "type": "video",
+                        "file_id": msg.video.file_id,
+                    }
+                )
+
+    if not cached_items:
+        return None
+
+    return {
+        "type": "album",
+        "items": cached_items,
+    }
 
 
 async def process_url(message, url, mode):
+    cached = get_cached(
+        url,
+        mode,
+    )
+
+    if cached:
+        if await send_cached(
+            message,
+            cached,
+        ):
+            return
+
     progress = await message.reply(
         URL_PROGRESS
     )
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory() as directory:
         if mode == "voice":
             files = await download_audio(
                 url,
-                d,
+                directory,
             )
         else:
-            files = await download_video(
+            files = await download_default(
                 url,
-                d,
+                directory,
             )
 
         if not files:
@@ -560,13 +696,13 @@ async def process_url(message, url, mode):
             return
 
         if mode == "voice":
-            audio = [
+            audio_files = [
                 f
                 for f in files
                 if media_type(f) == "audio"
             ]
 
-            if not audio:
+            if not audio_files:
                 try:
                     await progress.edit_text(
                         URL_FAILED
@@ -581,14 +717,26 @@ async def process_url(message, url, mode):
             except Exception:
                 pass
 
-            await send_voice(
+            cached_result = await send_voice_file(
                 message,
-                audio[0],
+                audio_files[0],
+            )
+
+            if not cached_result:
+                await message.reply(
+                    URL_FAILED
+                )
+                return
+
+            save_cached(
+                url,
+                mode,
+                cached_result,
             )
 
             return
 
-        media = [
+        media_files = [
             f
             for f in files
             if media_type(f) in {
@@ -597,13 +745,55 @@ async def process_url(message, url, mode):
             }
         ]
 
-        if not media:
+        if not media_files:
+            audio_files = [
+                f
+                for f in files
+                if media_type(f) == "audio"
+            ]
+
+            document_files = [
+                f
+                for f in files
+                if media_type(f) == "document"
+            ]
+
             try:
-                await progress.edit_text(
-                    URL_FAILED
-                )
+                await progress.delete()
             except Exception:
                 pass
+
+            if audio_files:
+                result = await send_single_file(
+                    message,
+                    audio_files[0],
+                )
+
+                save_cached(
+                    url,
+                    mode,
+                    result,
+                )
+
+                return
+
+            if document_files:
+                result = await send_single_file(
+                    message,
+                    document_files[0],
+                )
+
+                save_cached(
+                    url,
+                    mode,
+                    result,
+                )
+
+                return
+
+            await message.reply(
+                URL_FAILED
+            )
 
             return
 
@@ -612,9 +802,21 @@ async def process_url(message, url, mode):
         except Exception:
             pass
 
-        await send_media(
+        cached_result = await send_album(
             message,
-            media,
+            media_files,
+        )
+
+        if not cached_result:
+            await message.reply(
+                URL_FAILED
+            )
+            return
+
+        save_cached(
+            url,
+            mode,
+            cached_result,
         )
 
 
@@ -761,56 +963,9 @@ async def message_handler(message: Message):
 
     if message.chat.type == ChatType.CHANNEL:
         chat_id = message.chat.id
-
         chat = get_chat_data(chat_id)
 
         if chat["disabled"]:
-            return
-
-        if text == "ادت":
-            user_id = (
-                message.from_user.id
-                if message.from_user
-                else None
-            )
-
-            if user_id is not None:
-                if await is_owner(
-                    chat_id,
-                    user_id,
-                ):
-                    await send_settings(
-                        message,
-                        chat["mode"],
-                        chat,
-                    )
-
-            return
-
-        if text == "بوت":
-            user_id = (
-                message.from_user.id
-                if message.from_user
-                else chat_id
-            )
-
-            user_data = get_user_reply_data(
-                chat_id,
-                user_id,
-            )
-
-            index = user_data["reply_index"]
-
-            await message.reply(
-                REPLIES[index]
-            )
-
-            user_data["reply_index"] = (
-                index + 1
-            ) % len(REPLIES)
-
-            save_data()
-
             return
 
         urls = extract_urls(text)
@@ -879,8 +1034,7 @@ async def mode_callback(
         and selected == "default"
     ):
         await callback.answer(
-            "لا يمكنك تعطيل الوضع الافتراضي\n"
-            "تستطيع تبديل الوضع وليس تعطيل كل الاوضاع",
+            "الوضع الافتراضي مفعل بالفعل",
             show_alert=True,
         )
         return
