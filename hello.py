@@ -11,7 +11,6 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
     ReplyParameters,
 )
 from yt_dlp import YoutubeDL
@@ -184,14 +183,24 @@ def get_latest_file(directory):
     )
 
 
-def search_youtube(query):
-    options = {
+def youtube_options():
+    return {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "noplaylist": True,
+        "remote_components": [
+            "ejs:github",
+        ],
+    }
+
+
+def search_youtube(query):
+    options = youtube_options()
+
+    options.update({
         "extract_flat": True,
         "skip_download": True,
-        "noplaylist": True,
-    }
+    })
 
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(
@@ -227,16 +236,15 @@ def search_youtube(query):
 
 
 def download_audio(url, directory):
-    options = {
+    options = youtube_options()
+
+    options.update({
         "format": "bestaudio/best",
         "outtmpl": str(
             Path(directory)
             / "%(title)s.%(ext)s"
         ),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    })
 
     with YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -245,7 +253,9 @@ def download_audio(url, directory):
 
 
 def download_video(url, directory):
-    options = {
+    options = youtube_options()
+
+    options.update({
         "format": (
             "bestvideo*+bestaudio/"
             "best"
@@ -254,10 +264,7 @@ def download_video(url, directory):
             Path(directory)
             / "%(title)s.%(ext)s"
         ),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    })
 
     with YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -655,7 +662,9 @@ async def text_handler(message):
 
         status_message = await message.answer(
             START_REPLY,
-            reply_parameters=reply_to(message),
+            reply_parameters=reply_to(
+                message
+            ),
         )
 
         accepted = await add_job(
