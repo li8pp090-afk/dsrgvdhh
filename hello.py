@@ -40,10 +40,7 @@ FAIL_REPLY = (
     "شم طيزي يلا"
 )
 
-YOUTUBE_REPLY = (
-    "ها تريد {query}\n"
-    "تمام عبي"
-)
+YOUTUBE_REPLY = "ها تريد {query}\nتمام عبي"
 
 
 URL_RE = re.compile(
@@ -63,7 +60,6 @@ user_modes = {}
 reply_indexes = {}
 mode_messages = {}
 chat_queues = {}
-running_tasks = set()
 
 
 MAX_ACTIVE = 3
@@ -273,7 +269,10 @@ async def convert_to_opus(
     source,
     directory,
 ):
-    output = Path(directory) / "voice.ogg"
+    output = (
+        Path(directory)
+        / "voice.ogg"
+    )
 
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
@@ -334,9 +333,36 @@ async def process_voice(
                 data,
                 filename="voice.ogg",
             ),
-            reply_parameters=reply_to(
-                message
+            reply_parameters=reply_to(message),
+        )
+
+
+async def process_youtube_voice(
+    message,
+    url,
+):
+    with tempfile.TemporaryDirectory() as directory:
+        source = await asyncio.to_thread(
+            download_audio,
+            url,
+            directory,
+        )
+
+        output = await convert_to_opus(
+            source,
+            directory,
+        )
+
+        data = await asyncio.to_thread(
+            output.read_bytes
+        )
+
+        await message.answer_voice(
+            BufferedInputFile(
+                data,
+                filename="voice.ogg",
             ),
+            reply_parameters=reply_to(message),
         )
 
 
@@ -361,9 +387,7 @@ async def process_video(
                 filename=source.name,
             ),
             supports_streaming=True,
-            reply_parameters=reply_to(
-                message
-            ),
+            reply_parameters=reply_to(message),
         )
 
 
@@ -398,9 +422,7 @@ async def run_download(
 
         await message.answer(
             FAIL_REPLY,
-            reply_parameters=reply_to(
-                message
-            ),
+            reply_parameters=reply_to(message),
         )
 
 
@@ -408,6 +430,8 @@ async def youtube_job(
     message,
     query,
 ):
+    status_message = None
+
     try:
         url = await asyncio.to_thread(
             search_youtube,
@@ -416,97 +440,91 @@ async def youtube_job(
 
         status_message = await message.answer(
             START_REPLY,
-            reply_parameters=reply_to(
-                message
-            ),
+            reply_parameters=reply_to(message),
+        )
+
+        await process_youtube_voice(
+            message,
+            url,
         )
 
         try:
-            await process_voice(
-                message,
-                url,
-            )
-
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-
+            await status_message.delete()
         except Exception:
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-
-            await message.answer(
-                FAIL_REPLY,
-                reply_parameters=reply_to(
-                    message
-                ),
-            )
+            pass
 
     except Exception:
+        if status_message:
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
+
         await message.answer(
             FAIL_REPLY,
-            reply_parameters=reply_to(
-                message
-            ),
+            reply_parameters=reply_to(message),
         )
 
 
 async def worker(chat_id):
-    queue = chat_queues[chat_id]
+    data = chat_queues[chat_id]
 
     while True:
-        job = await queue["queue"].get()
+        job = await data["queue"].get()
 
-        queue["waiting"] -= 1
-        queue["active"] += 1
+        data["waiting"] -= 1
+        data["active"] += 1
 
         try:
             await job()
         except Exception:
             pass
         finally:
-            queue["active"] -= 1
-            queue["queue"].task_done()
+            data["active"] -= 1
+            data["queue"].task_done()
 
 
 async def ensure_chat(chat_id):
-    if chat_id not in chat_queues:
-        chat_queues[chat_id] = {
-            "active": 0,
-            "waiting": 0,
-            "queue": asyncio.Queue(),
-            "workers": [],
-        }
+    if chat_id in chat_queues:
+        return
 
-        for _ in range(MAX_ACTIVE):
-            task = asyncio.create_task(
-                worker(chat_id)
-            )
+    chat_queues[chat_id] = {
+        "active": 0,
+        "waiting": 0,
+        "queue": asyncio.Queue(),
+        "workers": [],
+    }
 
-            chat_queues[chat_id][
-                "workers"
-            ].append(task)
+    for _ in range(MAX_ACTIVE):
+        task = asyncio.create_task(
+            worker(chat_id)
+        )
+
+        chat_queues[chat_id]["workers"].append(
+            task
+        )
 
 
-async def add_job(message, job):
+async def add_job(
+    message,
+    job,
+):
     chat_id = message.chat.id
 
     await ensure_chat(chat_id)
 
-    queue = chat_queues[chat_id]
+    data = chat_queues[chat_id]
 
     if (
-        queue["active"]
-        + queue["waiting"]
+        data["active"]
+        + data["waiting"]
         >= MAX_ACTIVE + MAX_WAITING
     ):
         return False
 
-    queue["waiting"] += 1
-    await queue["queue"].put(job)
+    data["waiting"] += 1
+
+    await data["queue"].put(job)
 
     return True
 
@@ -637,9 +655,7 @@ async def text_handler(message):
 
         status_message = await message.answer(
             START_REPLY,
-            reply_parameters=reply_to(
-                message
-            ),
+            reply_parameters=reply_to(message),
         )
 
         accepted = await add_job(
@@ -664,9 +680,7 @@ async def text_handler(message):
 
     await message.answer(
         REPLIES[index],
-        reply_parameters=reply_to(
-            message
-        ),
+        reply_parameters=reply_to(message),
     )
 
     reply_indexes[key] = (
