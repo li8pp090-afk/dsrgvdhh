@@ -40,8 +40,13 @@ REPLIES = (
     "مو ناوي تستعملني مثل\nالبوتات ترى بس اضوج ينتفخ ديسي",
 )
 
+MAX_CONCURRENT_DOWNLOADS = 3
+MAX_WAITING_DOWNLOADS = 3
+
 data_store = {}
 download_locks = {}
+chat_download_semaphores = {}
+chat_download_queues = {}
 
 
 def load_data():
@@ -224,6 +229,7 @@ def inspect_url_sync(url):
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "noplaylist": True,
     }
 
     with YoutubeDL(options) as ydl:
@@ -243,27 +249,54 @@ async def get_info(url):
         return None
 
 
+def valid_audio_format(fmt):
+    return (
+        fmt.get("vcodec") == "none"
+        and fmt.get("acodec")
+        and fmt.get("acodec") != "none"
+    )
+
+
+def valid_video_format(fmt):
+    return (
+        fmt.get("vcodec")
+        and fmt.get("vcodec") != "none"
+    )
+
+
+def audio_score(fmt):
+    return (
+        fmt.get("abr") or 0,
+        fmt.get("tbr") or 0,
+        fmt.get("asr") or 0,
+        fmt.get("filesize") or 0,
+    )
+
+
+def video_score(fmt):
+    return (
+        fmt.get("height") or 0,
+        fmt.get("fps") or 0,
+        fmt.get("vbr") or 0,
+        fmt.get("tbr") or 0,
+        fmt.get("filesize") or 0,
+    )
+
+
 def choose_audio_format(info):
     formats = info.get("formats") or []
 
     audio_formats = [
-        f
-        for f in formats
-        if (
-            f.get("acodec")
-            and f.get("acodec") != "none"
-        )
+        fmt
+        for fmt in formats
+        if valid_audio_format(fmt)
     ]
 
     if not audio_formats:
         return "bestaudio/best"
 
     audio_formats.sort(
-        key=lambda f: (
-            f.get("abr") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
+        key=audio_score,
         reverse=True,
     )
 
@@ -276,58 +309,55 @@ def choose_audio_format(info):
 def choose_video_format(info):
     formats = info.get("formats") or []
 
-    combined = [
-        f
-        for f in formats
-        if (
-            f.get("vcodec")
-            and f.get("vcodec") != "none"
-            and f.get("acodec")
-            and f.get("acodec") != "none"
-        )
+    video_formats = [
+        fmt
+        for fmt in formats
+        if valid_video_format(fmt)
     ]
+
+    if not video_formats:
+        return "best"
 
     separate_video = [
-        f
-        for f in formats
+        fmt
+        for fmt in video_formats
         if (
-            f.get("vcodec")
-            and f.get("vcodec") != "none"
-            and (
-                not f.get("acodec")
-                or f.get("acodec") == "none"
-            )
+            not fmt.get("acodec")
+            or fmt.get("acodec") == "none"
         )
     ]
 
-    combined.sort(
-        key=lambda f: (
-            f.get("height") or 0,
-            f.get("fps") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
-        reverse=True,
-    )
+    combined_video = [
+        fmt
+        for fmt in video_formats
+        if (
+            fmt.get("acodec")
+            and fmt.get("acodec") != "none"
+        )
+    ]
 
     separate_video.sort(
-        key=lambda f: (
-            f.get("height") or 0,
-            f.get("fps") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
+        key=video_score,
         reverse=True,
     )
 
-    if combined:
-        return combined[0]["format_id"]
+    combined_video.sort(
+        key=video_score,
+        reverse=True,
+    )
 
     if separate_video:
         audio = choose_audio_format(info)
 
         return (
-            f'{separate_video[0]["format_id"]}+{audio}'
+            f'{separate_video[0]["format_id"]}'
+            f'+{audio}'
+        )
+
+    if combined_video:
+        return combined_video[0].get(
+            "format_id",
+            "best",
         )
 
     return "best"
@@ -344,7 +374,8 @@ def download_sync(url, directory, selector):
         "outtmpl": output,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": False,
+        "noplaylist": True,
+        "merge_output_format": None,
     }
 
     with YoutubeDL(options) as ydl:
@@ -454,7 +485,7 @@ async def convert_voice(source, destination):
         stderr=asyncio.subprocess.PIPE,
     )
 
-    _, stderr = await process.communicate()
+    _, _ = await process.communicate()
 
     return (
         process.returncode == 0
@@ -590,6 +621,7 @@ async def send_media(message, files):
                             media=FSInputFile(path)
                         )
                     )
+
                 elif kind == "video":
                     media.append(
                         InputMediaVideo(
@@ -694,6 +726,7 @@ async def send_cached(message, cached):
                                 media=item["file_id"]
                             )
                         )
+
                     elif item["type"] == "video":
                         media.append(
                             InputMediaVideo(
@@ -725,7 +758,27 @@ def get_lock(url, mode):
     return download_locks[key]
 
 
+def get_chat_semaphore(chat_id):
+    if chat_id not in chat_download_semaphores:
+        chat_download_semaphores[chat_id] = (
+            asyncio.Semaphore(
+                MAX_CONCURRENT_DOWNLOADS
+            )
+        )
+
+    return chat_download_semaphores[chat_id]
+
+
+def get_chat_queue(chat_id):
+    if chat_id not in chat_download_queues:
+        chat_download_queues[chat_id] = set()
+
+    return chat_download_queues[chat_id]
+
+
 async def process_url(message, url, mode):
+    chat_id = message.chat.id
+
     cached = get_cached(
         url,
         mode,
@@ -738,100 +791,138 @@ async def process_url(message, url, mode):
         ):
             return
 
-    async with get_lock(url, mode):
-        cached = get_cached(
-            url,
-            mode,
-        )
+    queue = get_chat_queue(chat_id)
 
-        if cached:
-            if await send_cached(
-                message,
-                cached,
-            ):
-                return
+    task_id = (
+        id(message),
+        url,
+        mode,
+    )
 
-        progress = await message.reply(
-            URL_PROGRESS
-        )
+    semaphore = get_chat_semaphore(chat_id)
 
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                if mode == "voice":
-                    files = await download_audio(
-                        url,
-                        directory,
-                    )
-                else:
-                    files = await download_video(
-                        url,
-                        directory,
-                    )
+    if semaphore.locked():
+        if len(queue) >= MAX_WAITING_DOWNLOADS:
+            await message.reply(
+                "الطابور ممتلئ حاليًا"
+            )
+            return
 
-                if not files:
-                    try:
-                        await progress.edit_text(
-                            URL_FAILED
-                        )
-                    except Exception:
-                        pass
+        queue.add(task_id)
 
+    try:
+        async with semaphore:
+            queue.discard(task_id)
+
+            cached = get_cached(
+                url,
+                mode,
+            )
+
+            if cached:
+                if await send_cached(
+                    message,
+                    cached,
+                ):
                     return
 
-                if mode == "voice":
-                    audio_files = [
-                        f
-                        for f in files
-                        if media_type(f) == "audio"
-                    ]
-
-                    if not audio_files:
-                        try:
-                            await progress.edit_text(
-                                URL_FAILED
-                            )
-                        except Exception:
-                            pass
-
-                        return
-
-                    result = await send_voice_file(
-                        message,
-                        audio_files[0],
-                    )
-
-                else:
-                    result = await send_media(
-                        message,
-                        files,
-                    )
-
-                if not result:
-                    try:
-                        await progress.edit_text(
-                            URL_FAILED
-                        )
-                    except Exception:
-                        pass
-
-                    return
-
-                save_cached(
+            async with get_lock(url, mode):
+                cached = get_cached(
                     url,
                     mode,
-                    result,
+                )
+
+                if cached:
+                    if await send_cached(
+                        message,
+                        cached,
+                    ):
+                        return
+
+                progress = await message.reply(
+                    URL_PROGRESS
                 )
 
                 try:
-                    await progress.delete()
-                except Exception:
-                    pass
+                    with tempfile.TemporaryDirectory() as directory:
+                        if mode == "voice":
+                            files = await download_audio(
+                                url,
+                                directory,
+                            )
+                        else:
+                            files = await download_video(
+                                url,
+                                directory,
+                            )
 
-        finally:
-            try:
-                await progress.delete()
-            except Exception:
-                pass
+                        if not files:
+                            try:
+                                await progress.edit_text(
+                                    URL_FAILED
+                                )
+                            except Exception:
+                                pass
+
+                            return
+
+                        if mode == "voice":
+                            audio_files = [
+                                f
+                                for f in files
+                                if media_type(f) == "audio"
+                            ]
+
+                            if not audio_files:
+                                try:
+                                    await progress.edit_text(
+                                        URL_FAILED
+                                    )
+                                except Exception:
+                                    pass
+
+                                return
+
+                            result = await send_voice_file(
+                                message,
+                                audio_files[0],
+                            )
+
+                        else:
+                            result = await send_media(
+                                message,
+                                files,
+                            )
+
+                        if not result:
+                            try:
+                                await progress.edit_text(
+                                    URL_FAILED
+                                )
+                            except Exception:
+                                pass
+
+                            return
+
+                        save_cached(
+                            url,
+                            mode,
+                            result,
+                        )
+
+                        try:
+                            await progress.delete()
+                        except Exception:
+                            pass
+
+                finally:
+                    try:
+                        await progress.delete()
+                    except Exception:
+                        pass
+
+    finally:
+        queue.discard(task_id)
 
 
 @router.message()
@@ -857,12 +948,20 @@ async def message_handler(message: Message):
         urls = extract_urls(text)
 
         if urls:
-            for url in urls:
-                await process_url(
-                    message,
-                    url,
-                    private["mode"],
+            tasks = [
+                asyncio.create_task(
+                    process_url(
+                        message,
+                        url,
+                        private["mode"],
+                    )
                 )
+                for url in urls
+            ]
+
+            await asyncio.gather(
+                *tasks
+            )
             return
 
         index = private["reply_index"]
@@ -954,12 +1053,20 @@ async def message_handler(message: Message):
         urls = extract_urls(text)
 
         if urls:
-            for url in urls:
-                await process_url(
-                    message,
-                    url,
-                    chat["mode"],
+            tasks = [
+                asyncio.create_task(
+                    process_url(
+                        message,
+                        url,
+                        chat["mode"],
+                    )
                 )
+                for url in urls
+            ]
+
+            await asyncio.gather(
+                *tasks
+            )
 
         return
 
@@ -973,12 +1080,20 @@ async def message_handler(message: Message):
         urls = extract_urls(text)
 
         if urls:
-            for url in urls:
-                await process_url(
-                    message,
-                    url,
-                    chat["mode"],
+            tasks = [
+                asyncio.create_task(
+                    process_url(
+                        message,
+                        url,
+                        chat["mode"],
+                    )
                 )
+                for url in urls
+            ]
+
+            await asyncio.gather(
+                *tasks
+            )
 
 
 @router.callback_query(
@@ -1034,7 +1149,7 @@ async def mode_callback(callback: CallbackQuery):
         and selected == "default"
     ):
         await callback.answer(
-            "الوضع الافتراضي مفعل بالفعل",
+            "الوضع الافتراضي\nمفعل بالفعل",
             show_alert=True,
         )
         return
