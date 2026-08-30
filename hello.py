@@ -18,7 +18,6 @@ from aiogram.types import (
 )
 from yt_dlp import YoutubeDL
 
-
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -32,16 +31,14 @@ dp.include_router(router)
 
 DATA_FILE = "id-file.json"
 
-URL_FAILED = (
-    "الرابط غير مدعوم او الموقع غير مدعوم\n"
-    "ههع شم كسي يلا"
-)
+URL_PROGRESS = "ههع تعال اضرط عليك\nالا تشم طيزي"
+
+URL_FAILED = "الرابط غير مدعوم او الموقع غير مدعوم\nههع شم كسي يلا"
 
 REPLIES = (
     "اهلين وسهلين\nاستاذ/ة",
     "وياك بوت ميديا دز رابط منشور\nالفيد وادزلكيا",
-    "مو ناوي تستعملني مثل\n"
-    "البوتات ترى بس اضوج ينتفخ ديسي",
+    "مو ناوي تستعملني مثل\nالبوتات ترى بس اضوج ينتفخ ديسي",
 )
 
 data_store = {}
@@ -55,11 +52,7 @@ def load_data():
         return
 
     try:
-        with open(
-            DATA_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             data_store = json.load(f)
     except Exception:
         data_store = {}
@@ -68,11 +61,7 @@ def load_data():
 def save_data():
     temp_file = DATA_FILE + ".tmp"
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8",
-    ) as f:
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(
             data_store,
             f,
@@ -80,10 +69,7 @@ def save_data():
             indent=2,
         )
 
-    os.replace(
-        temp_file,
-        DATA_FILE,
-    )
+    os.replace(temp_file, DATA_FILE)
 
 
 load_data()
@@ -137,17 +123,8 @@ def get_user_reply_data(chat_id, user_id):
 
 
 def build_mode_keyboard(mode):
-    voice_style = (
-        "primary"
-        if mode == "voice"
-        else "danger"
-    )
-
-    default_style = (
-        "primary"
-        if mode == "default"
-        else "danger"
-    )
+    voice_style = "primary" if mode == "voice" else "danger"
+    default_style = "primary" if mode == "default" else "danger"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -181,9 +158,7 @@ async def delete_previous_settings(chat_id, message_id):
 
 
 async def send_settings(message, mode, owner_data):
-    old_message_id = owner_data.get(
-        "last_settings_message"
-    )
+    old_message_id = owner_data.get("last_settings_message")
 
     if old_message_id:
         await delete_previous_settings(
@@ -196,9 +171,7 @@ async def send_settings(message, mode, owner_data):
         reply_markup=build_mode_keyboard(mode),
     )
 
-    owner_data["last_settings_message"] = (
-        settings_message.message_id
-    )
+    owner_data["last_settings_message"] = settings_message.message_id
 
     save_data()
 
@@ -225,10 +198,7 @@ def extract_urls(text):
     for word in text.split():
         word = word.strip("()[]{}<>\"'")
 
-        if (
-            word.startswith("http://")
-            or word.startswith("https://")
-        ):
+        if word.startswith("http://") or word.startswith("https://"):
             result.append(word)
 
     return result
@@ -386,12 +356,7 @@ def best_video(info):
     return None, None
 
 
-def download(
-    url,
-    directory,
-    selector,
-    progress_hook=None,
-):
+def download(url, directory, selector):
     output = os.path.join(
         directory,
         "%(playlist_index)05d-%(title)s.%(ext)s",
@@ -404,11 +369,6 @@ def download(
         "no_warnings": True,
     }
 
-    if progress_hook:
-        options["progress_hooks"] = [
-            progress_hook
-        ]
-
     with YoutubeDL(options) as ydl:
         return ydl.extract_info(
             url,
@@ -416,75 +376,7 @@ def download(
         )
 
 
-async def update_progress(progress_message, value):
-    value = max(
-        0,
-        min(100, value),
-    )
-
-    value = (
-        value // 25
-    ) * 25
-
-    try:
-        await progress_message.edit_text(
-            f"{value}%"
-        )
-    except Exception:
-        pass
-
-
-def make_progress_hook(progress_message, loop):
-    state = {
-        "value": -1,
-    }
-
-    def hook(status):
-        if status.get("status") != "downloading":
-            return
-
-        total = (
-            status.get("total_bytes")
-            or status.get("total_bytes_estimate")
-        )
-
-        downloaded = (
-            status.get("downloaded_bytes")
-            or 0
-        )
-
-        if not total:
-            return
-
-        percent = int(
-            downloaded * 100 / total
-        )
-
-        percent = (
-            percent // 25
-        ) * 25
-
-        if percent == state["value"]:
-            return
-
-        state["value"] = percent
-
-        asyncio.run_coroutine_threadsafe(
-            update_progress(
-                progress_message,
-                percent,
-            ),
-            loop,
-        )
-
-    return hook
-
-
-async def download_audio(
-    url,
-    directory,
-    progress_message,
-):
+async def download_audio(url, directory):
     info = await get_info(url)
 
     if not info:
@@ -495,20 +387,12 @@ async def download_audio(
     if not audio:
         return []
 
-    loop = asyncio.get_running_loop()
-
-    hook = make_progress_hook(
-        progress_message,
-        loop,
-    )
-
     try:
         await asyncio.to_thread(
             download,
             url,
             directory,
             audio["format_id"],
-            hook,
         )
     except Exception:
         return []
@@ -516,11 +400,7 @@ async def download_audio(
     return files_in(directory)
 
 
-async def download_video(
-    url,
-    directory,
-    progress_message,
-):
+async def download_video(url, directory):
     info = await get_info(url)
 
     if not info:
@@ -539,20 +419,12 @@ async def download_video(
     else:
         selector = video["format_id"]
 
-    loop = asyncio.get_running_loop()
-
-    hook = make_progress_hook(
-        progress_message,
-        loop,
-    )
-
     try:
         await asyncio.to_thread(
             download,
             url,
             directory,
             selector,
-            hook,
         )
     except Exception:
         return []
@@ -560,23 +432,18 @@ async def download_video(
     return files_in(directory)
 
 
-async def convert_voice(
-    source,
-    destination,
-):
-    process = (
-        await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source),
-            "-vn",
-            "-c:a",
-            "libopus",
-            destination,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+async def convert_voice(source, destination):
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-c:a",
+        "libopus",
+        destination,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
 
     await process.communicate()
@@ -587,10 +454,7 @@ async def convert_voice(
     )
 
 
-async def send_voice(
-    message,
-    source,
-):
+async def send_voice(message, source):
     with tempfile.TemporaryDirectory() as d:
         destination = os.path.join(
             d,
@@ -608,15 +472,11 @@ async def send_voice(
         )
 
 
-async def send_media(
-    message,
-    files,
-):
+async def send_media(message, files):
     media = [
         f
         for f in files
-        if media_type(f)
-        in {
+        if media_type(f) in {
             "image",
             "video",
         }
@@ -639,18 +499,10 @@ async def send_media(
 
         return True
 
-    previous_message_id = (
-        message.message_id
-    )
+    previous_message_id = message.message_id
 
-    for start in range(
-        0,
-        len(media),
-        10,
-    ):
-        batch = media[
-            start:start + 10
-        ]
+    for start in range(0, len(media), 10):
+        batch = media[start:start + 10]
 
         telegram_media = []
 
@@ -675,35 +527,26 @@ async def send_media(
         )
 
         if sent:
-            previous_message_id = (
-                sent[-1].message_id
-            )
+            previous_message_id = sent[-1].message_id
 
     return True
 
 
-async def process_url(
-    message,
-    url,
-    mode,
-):
+async def process_url(message, url, mode):
     progress = await message.reply(
-        "0%"
+        URL_PROGRESS
     )
 
     with tempfile.TemporaryDirectory() as d:
-
         if mode == "voice":
             files = await download_audio(
                 url,
                 d,
-                progress,
             )
         else:
             files = await download_video(
                 url,
                 d,
-                progress,
             )
 
         if not files:
@@ -748,8 +591,7 @@ async def process_url(
         media = [
             f
             for f in files
-            if media_type(f)
-            in {
+            if media_type(f) in {
                 "image",
                 "video",
             }
@@ -835,9 +677,7 @@ async def message_handler(message: Message):
         chat_id = message.chat.id
         user_id = message.from_user.id
 
-        chat = get_chat_data(
-            chat_id
-        )
+        chat = get_chat_data(chat_id)
 
         if text == "ادت":
             if await is_owner(
@@ -922,9 +762,7 @@ async def message_handler(message: Message):
     if message.chat.type == ChatType.CHANNEL:
         chat_id = message.chat.id
 
-        chat = get_chat_data(
-            chat_id
-        )
+        chat = get_chat_data(chat_id)
 
         if chat["disabled"]:
             return
@@ -1021,8 +859,7 @@ async def mode_callback(
             user_id,
         ):
             await callback.answer(
-                "ليس مصرح لك\n"
-                "بالقيام بهذا",
+                "ليس مصرح لك\nبالقيام بهذا",
                 show_alert=True,
             )
             return
