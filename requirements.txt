@@ -3,6 +3,3 @@ yt-dlp
 aiohttp
 aiosqlite
 aiodns
-mutagen
-requests
-bgutil-ytdlp-pot-provider
