@@ -37,6 +37,7 @@ BOT_REPLIES = [
 reply_state = {}
 success_state = {}
 edit_state = {}
+in_progress = set()
 reply_state_lock = asyncio.Lock()
 
 router = Router()
@@ -179,19 +180,6 @@ async def save_file_record(scope, mode, source_type, content_id, file_id, filena
         await db.commit()
 
 
-async def get_file_record_by_file_id(scope: str, mode: str, file_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT source_type, content_id, file_id, filename
-            FROM id_files
-            WHERE scope_key = ?
-              AND mode = ?
-              AND file_id = ?
-            LIMIT 1
-        """, (scope, mode, file_id))
-        return await cur.fetchone()
-
-
 async def next_success_reply(scope: str) -> str:
     async with reply_state_lock:
         index = success_state.get(scope, 0)
@@ -216,6 +204,17 @@ async def send_voice_reply(bot: Bot, message: Message, voice, **kwargs):
 async def send_document_reply(bot: Bot, message: Message, document, **kwargs):
     kwargs["reply_parameters"] = reply_parameters(message)
     return await bot.send_document(chat_id=message.chat.id, document=document, **kwargs)
+
+
+async def claim_content(key):
+    if key in in_progress:
+        return False
+    in_progress.add(key)
+    return True
+
+
+def release_content(key):
+    in_progress.discard(key)
 
 
 async def is_chat_owner(message: Message) -> bool:
@@ -419,14 +418,18 @@ async def process_url(
     scope = scope_for_message(message)
     source_type = "url"
     content_id = sha256_id(url)
+    progress_key = (scope, mode, source_type, content_id)
+    if not await claim_content(progress_key):
+        return
 
     existing = await get_file_record(
         scope, mode, source_type, content_id
     )
     if existing:
-        await send_saved_file(
-            bot, message, mode, existing[0]
-        )
+        try:
+            await send_saved_file(bot, message, mode, existing[0])
+        finally:
+            release_content(progress_key)
         return
 
     status = await answer_reply(message, START_TEXT)
@@ -489,6 +492,7 @@ async def process_url(
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
+        release_content(progress_key)
 
 
 async def process_youtube(
@@ -513,6 +517,10 @@ async def process_youtube(
         if not video_id or not video_url:
             raise RuntimeError("youtube result has no URL")
 
+        progress_key = (scope, mode, "youtube", video_id)
+        if not await claim_content(progress_key):
+            return
+
         existing = await get_file_record(
             scope,
             mode,
@@ -521,12 +529,10 @@ async def process_youtube(
         )
 
         if existing:
-            await send_saved_file(
-                bot,
-                message,
-                mode,
-                existing[0],
-            )
+            try:
+                await send_saved_file(bot, message, mode, existing[0])
+            finally:
+                release_content(progress_key)
             return
 
         status = await answer_reply(
@@ -591,6 +597,8 @@ async def process_youtube(
             except Exception:
                 pass
         shutil.rmtree(workdir, ignore_errors=True)
+        if "progress_key" in locals():
+            release_content(progress_key)
 
 
 async def submit_job(
@@ -608,8 +616,10 @@ async def submit_job(
         return
 
 
+
 def parse_duration(value: str) -> int | None:
     value = (value or "").strip()
+
     match = re.fullmatch(r"(\d+)\.(\d{1,2}):(\d{1,2})", value)
     if match:
         hours = int(match.group(1))
@@ -764,9 +774,7 @@ async def voice_edit_handler(message: Message):
         )
 
         scope = scope_for_message(message)
-        content_id = sha256_id(
-            f"edited:{file_id}:{start}:{end}"
-        )
+        content_id = sha256_id(f"edited:{file_id}:{start}:{end}")
 
         await save_file_record(
             scope,
