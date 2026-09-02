@@ -14,7 +14,7 @@ from aiogram.enums import ChatType, ButtonStyle
 
 import yt_dlp
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 MAX_CONCURRENT_DOWNLOADS = 3
 MAX_QUEUE_SIZE = 3
@@ -307,7 +307,7 @@ async def run_download_workflow(chat_id: int, user_id: int, task_type: str, payl
                         uploader = meta.get('uploader') or meta.get('channel')
                         title = meta.get('title')
                         formatted_name = sanitize_and_format_title(uploader, title) + ext
-                        return file_path, formatted_name
+                        return file_path, formatted_filename
 
                 file_path, formatted_filename = await loop.run_in_executor(None, download_default_video)
 
