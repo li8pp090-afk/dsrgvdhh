@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import aiosqlite
 import yt_dlp
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ReplyParameters
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
@@ -22,12 +22,6 @@ START_TEXT = "ههع شم كسي\nيلا"
 FAIL_TEXT = "الرابط غير مدعوم او الموقع مو راضي يتعاون\nشم طيزي يلا"
 YT_START_TEXT = "ها تريد {query}\nتمام عبي"
 YT_FAIL_TEXT = "الرابط غير مدعوم او اليوتيوب مو راضي يتعاون\nشم طيزي يلا"
-DEFAULT_SUCCESS_REPLIES = [
-    "هلو باي\nاه",
-    "باي هلو\nاه",
-    "اه باي\nهلو",
-    "اه هلو\nباي",
-]
 BOT_REPLIES = [
     "اهلين وسهلين\nاستاذ/ة",
     "وياك بوت ميديا دز رابط منشور\nالفيد وادزلكيا",
@@ -35,9 +29,6 @@ BOT_REPLIES = [
     "راح انزع وتنيكني بدال هذا\nالنيج شو داضوج",
 ]
 reply_state = {}
-success_state = {}
-edit_state = {}
-in_progress = set()
 reply_state_lock = asyncio.Lock()
 
 router = Router()
@@ -180,43 +171,6 @@ async def save_file_record(scope, mode, source_type, content_id, file_id, filena
         await db.commit()
 
 
-async def next_success_reply(scope: str) -> str:
-    async with reply_state_lock:
-        index = success_state.get(scope, 0)
-        success_state[scope] = (index + 1) % len(DEFAULT_SUCCESS_REPLIES)
-    return DEFAULT_SUCCESS_REPLIES[index]
-
-
-def reply_parameters(message: Message) -> ReplyParameters:
-    return ReplyParameters(message_id=message.message_id)
-
-
-async def answer_reply(message: Message, text: str, **kwargs):
-    kwargs["reply_parameters"] = reply_parameters(message)
-    return await message.answer(text, **kwargs)
-
-
-async def send_voice_reply(bot: Bot, message: Message, voice, **kwargs):
-    kwargs["reply_parameters"] = reply_parameters(message)
-    return await bot.send_voice(chat_id=message.chat.id, voice=voice, **kwargs)
-
-
-async def send_document_reply(bot: Bot, message: Message, document, **kwargs):
-    kwargs["reply_parameters"] = reply_parameters(message)
-    return await bot.send_document(chat_id=message.chat.id, document=document, **kwargs)
-
-
-async def claim_content(key):
-    if key in in_progress:
-        return False
-    in_progress.add(key)
-    return True
-
-
-def release_content(key):
-    in_progress.discard(key)
-
-
 async def is_chat_owner(message: Message) -> bool:
     if message.chat.type == "private":
         return True
@@ -272,8 +226,7 @@ async def edit_mode(message: Message):
     scope = scope_for_message(message)
     mode = await get_mode(scope)
 
-    await answer_reply(
-        message,
+    await message.answer(
         "تستطيع تغيير وضع عمل البوت\nمن هنا",
         reply_markup=settings_markup(mode),
     )
@@ -401,9 +354,15 @@ async def send_saved_file(
     file_id: str,
 ):
     if mode == "voice":
-        await send_voice_reply(bot, message, file_id)
+        await bot.send_voice(
+            chat_id=message.chat.id,
+            voice=file_id,
+        )
     else:
-        await send_document_reply(bot, message, file_id)
+        await bot.send_document(
+            chat_id=message.chat.id,
+            document=file_id,
+        )
 
 
 async def process_url(
@@ -418,21 +377,17 @@ async def process_url(
     scope = scope_for_message(message)
     source_type = "url"
     content_id = sha256_id(url)
-    progress_key = (scope, mode, source_type, content_id)
-    if not await claim_content(progress_key):
-        return
 
     existing = await get_file_record(
         scope, mode, source_type, content_id
     )
     if existing:
-        try:
-            await send_saved_file(bot, message, mode, existing[0])
-        finally:
-            release_content(progress_key)
+        await send_saved_file(
+            bot, message, mode, existing[0]
+        )
         return
 
-    status = await answer_reply(message, START_TEXT)
+    status = await message.answer(START_TEXT)
     workdir = tempfile.mkdtemp(prefix="download_")
 
     try:
@@ -447,10 +402,9 @@ async def process_url(
             output = Path(workdir) / "voice.ogg"
             await convert_to_ogg_opus(path, output)
 
-            sent = await send_voice_reply(
-                bot,
-                message,
-                FSInputFile(output),
+            sent = await bot.send_voice(
+                chat_id=message.chat.id,
+                voice=FSInputFile(output),
             )
 
             await save_file_record(
@@ -464,10 +418,9 @@ async def process_url(
         else:
             filename = build_filename(info, path)
 
-            sent = await send_document_reply(
-                bot,
-                message,
-                FSInputFile(
+            sent = await bot.send_document(
+                chat_id=message.chat.id,
+                document=FSInputFile(
                     path,
                     filename=filename,
                 ),
@@ -481,10 +434,9 @@ async def process_url(
                 sent.document.file_id,
                 filename,
             )
-            await answer_reply(message, await next_success_reply(scope))
 
     except Exception:
-        await answer_reply(message, FAIL_TEXT)
+        await message.answer(FAIL_TEXT)
 
     finally:
         try:
@@ -492,7 +444,6 @@ async def process_url(
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
-        release_content(progress_key)
 
 
 async def process_youtube(
@@ -517,10 +468,6 @@ async def process_youtube(
         if not video_id or not video_url:
             raise RuntimeError("youtube result has no URL")
 
-        progress_key = (scope, mode, "youtube", video_id)
-        if not await claim_content(progress_key):
-            return
-
         existing = await get_file_record(
             scope,
             mode,
@@ -529,14 +476,15 @@ async def process_youtube(
         )
 
         if existing:
-            try:
-                await send_saved_file(bot, message, mode, existing[0])
-            finally:
-                release_content(progress_key)
+            await send_saved_file(
+                bot,
+                message,
+                mode,
+                existing[0],
+            )
             return
 
-        status = await answer_reply(
-            message,
+        status = await message.answer(
             YT_START_TEXT.format(query=query)
         )
 
@@ -551,10 +499,9 @@ async def process_youtube(
             output = Path(workdir) / f"{video_id}.ogg"
             await convert_to_ogg_opus(path, output)
 
-            sent = await send_voice_reply(
-                bot,
-                message,
-                FSInputFile(output),
+            sent = await bot.send_voice(
+                chat_id=message.chat.id,
+                voice=FSInputFile(output),
             )
 
             await save_file_record(
@@ -568,10 +515,9 @@ async def process_youtube(
         else:
             filename = build_filename(info, path)
 
-            sent = await send_document_reply(
-                bot,
-                message,
-                FSInputFile(
+            sent = await bot.send_document(
+                chat_id=message.chat.id,
+                document=FSInputFile(
                     path,
                     filename=filename,
                 ),
@@ -585,10 +531,9 @@ async def process_youtube(
                 sent.document.file_id,
                 filename,
             )
-            await answer_reply(message, await next_success_reply(scope))
 
     except Exception:
-        await answer_reply(message, YT_FAIL_TEXT)
+        await message.answer(YT_FAIL_TEXT)
 
     finally:
         if status:
@@ -597,8 +542,6 @@ async def process_youtube(
             except Exception:
                 pass
         shutil.rmtree(workdir, ignore_errors=True)
-        if "progress_key" in locals():
-            release_content(progress_key)
 
 
 async def submit_job(
@@ -614,184 +557,6 @@ async def submit_job(
         )
     except asyncio.QueueFull:
         return
-
-
-
-def parse_duration(value: str) -> int | None:
-    value = (value or "").strip()
-
-    match = re.fullmatch(r"(\d+)\.(\d{1,2}):(\d{1,2})", value)
-    if match:
-        hours = int(match.group(1))
-        minutes = int(match.group(2))
-        seconds = int(match.group(3))
-        if minutes >= 60 or seconds >= 60:
-            return None
-        return hours * 3600 + minutes * 60 + seconds
-
-    match = re.fullmatch(r"(\d+):(\d{1,2})", value)
-    if match:
-        minutes = int(match.group(1))
-        seconds = int(match.group(2))
-        if seconds >= 60:
-            return None
-        return minutes * 60 + seconds
-
-    return None
-
-
-def parse_edit_range(value: str) -> tuple[int, int] | None:
-    parts = re.split(r"\s*/\s*", (value or "").strip())
-    if len(parts) != 2:
-        return None
-
-    start = parse_duration(parts[0])
-    end = parse_duration(parts[1])
-
-    if start is None or end is None or end <= start:
-        return None
-
-    return start, end
-
-
-async def get_replied_voice_record(message: Message):
-    replied = message.reply_to_message
-    if not replied or not replied.voice:
-        return None
-
-    scope = scope_for_message(message)
-    return await get_file_record_by_file_id(
-        scope,
-        "voice",
-        replied.voice.file_id,
-    )
-
-
-async def download_telegram_file(bot: Bot, file_id: str, workdir: str) -> Path:
-    telegram_file = await bot.get_file(file_id)
-    if not telegram_file.file_path:
-        raise RuntimeError("telegram file path missing")
-
-    suffix = Path(telegram_file.file_path).suffix or ".ogg"
-    target = Path(workdir) / f"source{suffix}"
-    await bot.download_file(telegram_file.file_path, destination=target)
-
-    if not target.exists():
-        raise RuntimeError("telegram file download failed")
-
-    return target
-
-
-async def trim_voice(source: Path, target: Path, start: int, end: int):
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-ss", str(start),
-        "-i", str(source),
-        "-t", str(end - start),
-        "-vn",
-        "-c:a", "libopus",
-        "-f", "ogg",
-        str(target),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    code = await process.wait()
-
-    if code != 0 or not target.exists():
-        raise RuntimeError("voice trim failed")
-
-
-@router.message(F.text.casefold() == "تعديل")
-async def edit_voice_start(message: Message):
-    record = await get_replied_voice_record(message)
-    if not record or not message.from_user:
-        return
-
-    key = (message.chat.id, message.from_user.id)
-    edit_state[key] = record[2]
-
-    await answer_reply(
-        message,
-        "تستطيع تعديل مدة الصوتيات هكذا\n12:45 / 18:36 وللساعات 12.30:48",
-    )
-
-
-@router.message(F.text)
-async def voice_edit_handler(message: Message):
-    if not message.from_user:
-        return
-
-    key = (message.chat.id, message.from_user.id)
-    file_id = edit_state.get(key)
-
-    if not file_id:
-        return
-
-    edit_range = parse_edit_range(message.text)
-    if not edit_range:
-        return
-
-    start, end = edit_range
-    workdir = tempfile.mkdtemp(prefix="voice_edit_")
-
-    try:
-        source = await download_telegram_file(
-            message.bot,
-            file_id,
-            workdir,
-        )
-
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(source),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        output, _ = await probe.communicate()
-
-        if probe.returncode != 0:
-            raise RuntimeError("duration check failed")
-
-        duration = float(output.decode().strip())
-        if start >= duration or end > duration:
-            await answer_reply(
-                message,
-                "مدة هذه الصوتيه اصغر من المدة اللتي\nارسلتها",
-            )
-            return
-
-        target = Path(workdir) / "edited.ogg"
-        await trim_voice(source, target, start, end)
-
-        sent = await send_voice_reply(
-            message.bot,
-            message,
-            FSInputFile(target),
-        )
-
-        scope = scope_for_message(message)
-        content_id = sha256_id(f"edited:{file_id}:{start}:{end}")
-
-        await save_file_record(
-            scope,
-            "voice",
-            "edited_voice",
-            content_id,
-            sent.voice.file_id,
-            "edited.ogg",
-        )
-
-        edit_state.pop(key, None)
-
-    except Exception:
-        await answer_reply(message, FAIL_TEXT)
-        edit_state.pop(key, None)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @router.message(F.text.startswith("يوت "))
@@ -817,7 +582,7 @@ async def rotating_reply(message: Message):
     async with reply_state_lock:
         index = reply_state.get(key, 0)
         reply_state[key] = (index + 1) % len(BOT_REPLIES)
-    await answer_reply(message, BOT_REPLIES[index])
+    await message.answer(BOT_REPLIES[index])
 
 
 @router.message(F.text)
