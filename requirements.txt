@@ -1,6 +1,7 @@
 aiogram
 yt-dlp
+youtube-search
+aiofiles
+aiodns
 aiohttp
 aiosqlite
-aiodns
-async-timeout
