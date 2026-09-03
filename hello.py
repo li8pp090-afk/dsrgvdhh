@@ -1,659 +1,394 @@
 import asyncio
-import hashlib
 import os
 import re
-import shutil
-import tempfile
-from pathlib import Path
-from urllib.parse import urlparse
-
+import random
 import aiosqlite
+from pathlib import Path
+from difflib import SequenceMatcher
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import CommandStart
+from aiogram.fsm.storage.memory import MemoryStorage
+
 import yt_dlp
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from youtube_search import YoutubeSearch
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+DB_PATH = "bot_data.db"
 
-ACTIVE_DOWNLOADS = 3
-WAITING_DOWNLOADS = 3
+MAX_ACTIVE_DOWNLOADS = 3
+MAX_QUEUED_DOWNLOADS = 3
+TOTAL_MAX_TASKS = MAX_ACTIVE_DOWNLOADS + MAX_QUEUED_DOWNLOADS
 
-START_TEXT = "ههع شم كسي\nيلا"
-FAIL_TEXT = "الرابط غير مدعوم او الموقع مو راضي يتعاون\nشم طيزي يلا"
-YT_START_TEXT = "ها تريد {query}\nتمام عبي"
-YT_FAIL_TEXT = "الرابط غير مدعوم او اليوتيوب مو راضي يتعاون\nشم طيزي يلا"
-BOT_REPLIES = [
-    "اهلين وسهلين\nاستاذ/ة",
-    "وياك بوت ميديا دز رابط منشور\nالفيد وادزلكيا",
-    "مو ناوي تستعملني مثل\nالبوتات ترى بس اضوج ينتفخ ديسي",
-    "راح انزع وتنيكني بدال هذا\nالنيج شو داضوج",
-]
-reply_state = {}
-reply_state_lock = asyncio.Lock()
+PATTERN_YOUTUBE = re.compile(r"(?:youtu\.be/|youtube\.com/)")
+PATTERN_URL = re.compile(r"https?://(?!t\.me/|telegram\.me/)[^\s]+")
+PATTERN_TELEGRAM = re.compile(r"https?://(?:t\.me|telegram\.me)/")
 
-router = Router()
-download_queue = asyncio.Queue(maxsize=WAITING_DOWNLOADS)
+file_id_cache = {"default": set(), "voice": set(), "yut": set()}
+trim_sessions = {}
+active_tasks = set()
+semaphore = asyncio.Semaphore(MAX_ACTIVE_DOWNLOADS)
 
-UPPER_EXCEPTIONS = set("ATFNMJULG")
-TELEGRAM_HOSTS = {
-    "t.me", "telegram.me", "telegram.dog",
-    "www.t.me", "www.telegram.me", "www.telegram.dog",
-}
-
-
-def scope_for_message(message: Message) -> str:
-    if message.chat.type == "private":
-        return f"user:{message.from_user.id}"
-    return f"chat:{message.chat.id}"
-
-
-def scope_for_callback(callback: CallbackQuery) -> str:
-    if callback.message and callback.message.chat.type == "private":
-        return f"user:{callback.from_user.id}"
-    return f"chat:{callback.message.chat.id}"
-
-
-def clean_component(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return ""
-    value = re.sub(r"[^\w\s-]", "", value, flags=re.UNICODE)
-    value = re.sub(r"[\r\n\t]+", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-
-    if re.search(r"[A-Za-z]", value):
-        chars = []
-        for ch in value:
-            if ch.isascii() and ch.isalpha():
-                chars.append(ch.upper() if ch.upper() in UPPER_EXCEPTIONS else ch.lower())
-            else:
-                chars.append(ch)
-        value = "".join(chars)
-
-    return value
-
-
-def build_filename(info: dict, actual_path: Path) -> str:
-    publisher = clean_component(
-        info.get("channel") or info.get("uploader") or info.get("creator") or ""
-    )
-    title = clean_component(info.get("title") or "")
-
-    if publisher and title:
-        stem = f"{publisher} - {title}"
-    else:
-        stem = publisher or title or clean_component(actual_path.stem) or "file"
-
-    return f"{stem}{actual_path.suffix}"
-
-
-def is_telegram_url(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-        return host in TELEGRAM_HOSTS or host.endswith(".telegram.org")
-    except Exception:
-        return False
-
-
-def normalize_url(text: str) -> str | None:
-    match = re.search(r"https?://\S+", text or "")
-    if not match:
-        return None
-    return match.group(0).rstrip(".,!?)]}")
-
-
-def sha256_id(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                scope_key TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
                 mode TEXT NOT NULL DEFAULT 'default'
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS id_files (
-                scope_key TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                content_id TEXT NOT NULL,
-                file_id TEXT NOT NULL,
-                filename TEXT,
-                PRIMARY KEY (scope_key, mode, source_type, content_id)
+            CREATE TABLE IF NOT EXISTS user_counters (
+                user_id INTEGER PRIMARY KEY,
+                reply_index INTEGER NOT NULL DEFAULT 0
             )
         """)
         await db.commit()
 
-
-async def get_mode(scope: str) -> str:
+async def get_chat_mode(chat_id: int) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT mode FROM settings WHERE scope_key = ?", (scope,)
-        )
-        row = await cur.fetchone()
-        return row[0] if row else "default"
+        async with db.execute("SELECT mode FROM chat_settings WHERE chat_id = ?", (chat_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else "default"
 
-
-async def set_mode(scope: str, mode: str):
+async def set_chat_mode(chat_id: int, mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO settings(scope_key, mode)
-            VALUES (?, ?)
-            ON CONFLICT(scope_key)
-            DO UPDATE SET mode = excluded.mode
-        """, (scope, mode))
+        await db.execute("INSERT OR REPLACE INTO chat_settings VALUES (?, ?)", (chat_id, mode))
         await db.commit()
 
-
-async def get_file_record(scope, mode, source_type, content_id):
+async def get_user_index(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT file_id, filename
-            FROM id_files
-            WHERE scope_key = ?
-              AND mode = ?
-              AND source_type = ?
-              AND content_id = ?
-        """, (scope, mode, source_type, content_id))
-        return await cur.fetchone()
+        async with db.execute("SELECT reply_index FROM user_counters WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
-
-async def save_file_record(scope, mode, source_type, content_id, file_id, filename):
+async def next_user_index(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO id_files
-            (scope_key, mode, source_type, content_id, file_id, filename)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (scope, mode, source_type, content_id, file_id, filename))
+        idx = await get_user_index(user_id)
+        new_idx = (idx + 1) % 4
+        await db.execute("INSERT OR REPLACE INTO user_counters VALUES (?, ?)", (user_id, new_idx))
         await db.commit()
+        return idx
 
+def format_case(text: str) -> str:
+    text = text.lower()
+    for c in "atfnmjulg":
+        text = text.replace(c, c.upper())
+    return text
 
-async def is_chat_owner(message: Message) -> bool:
-    if message.chat.type == "private":
-        return True
+def sanitize_filename(channel, title):
+    def clean_part(s):
+        s = re.sub(r'[\\/*?:"<>|]', '', s)
+        s = re.sub(r'[^\w\s-]', '', s)
+        return s.strip()
+    return format_case(f"{clean_part(channel)} - {clean_part(title)}")
 
-    if not message.from_user:
-        return False
-
+async def search_youtube(query: str):
     try:
-        member = await message.bot.get_chat_member(
-            message.chat.id, message.from_user.id
-        )
-        return member.status == "creator"
+        results = YoutubeSearch(query, max_results=3).to_dict()
+        if not results:
+            return None
+        q_low = query.lower()
+        best = max(results, key=lambda r: SequenceMatcher(None, q_low, r.get("title", "").lower()).ratio())
+        return best
     except Exception:
-        return False
+        return None
 
-
-async def is_callback_owner(callback: CallbackQuery) -> bool:
-    if not callback.message:
-        return False
-
-    if callback.message.chat.type == "private":
-        return True
-
+async def get_chat_owner_id(bot: Bot, chat_id: int):
     try:
-        member = await callback.bot.get_chat_member(
-            callback.message.chat.id, callback.from_user.id
-        )
-        return member.status == "creator"
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if admin.status == "creator":
+                return admin.user.id
     except Exception:
-        return False
+        pass
+    return None
 
-
-def settings_markup(mode: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="صوت",
-            callback_data="mode:voice",
-            style="primary" if mode == "voice" else "danger",
-        ),
-        InlineKeyboardButton(
-            text="افتراضي",
-            callback_data="mode:default",
-            style="primary" if mode == "default" else "danger",
-        ),
-    ]])
-
-
-@router.message(F.text == "ادت")
-async def edit_mode(message: Message):
-    if not await is_chat_owner(message):
-        return
-
-    scope = scope_for_message(message)
-    mode = await get_mode(scope)
-
-    await message.answer(
-        "تستطيع تغيير وضع عمل البوت\nمن هنا",
-        reply_markup=settings_markup(mode),
+def get_settings_keyboard(mode: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="فويس",
+        callback_data="setmode:voice",
+        color="primary" if mode == "voice" else "danger"
     )
-
-
-@router.callback_query(F.data.startswith("mode:"))
-async def mode_callback(callback: CallbackQuery):
-    if not callback.message:
-        await callback.answer()
-        return
-
-    if not await is_callback_owner(callback):
-        await callback.answer(
-            "عزيزي\nليس مصرح لك بذلك",
-            show_alert=True,
-        )
-        return
-
-    requested = callback.data.split(":", 1)[1]
-    scope = scope_for_callback(callback)
-    current = await get_mode(scope)
-
-    if requested == "default" and current == "default":
-        await callback.answer(
-            "زر افتراضي مُفعل\nبالفعل",
-            show_alert=True,
-        )
-        return
-
-    if requested == "voice" and current == "voice":
-        requested = "default"
-
-    await set_mode(scope, requested)
-
-    await callback.message.edit_reply_markup(
-        reply_markup=settings_markup(requested)
+    kb.button(
+        text="افتراضي",
+        callback_data="setmode:default",
+        color="primary" if mode == "default" else "danger"
     )
-    await callback.answer()
+    kb.adjust(2)
+    return kb.as_markup()
 
-
-def ytdlp_options(workdir: str, mode: str) -> dict:
-    options = {
+async def download_default(url: str):
+    opts = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": str(DOWNLOAD_DIR / "%(uploader)s - %(title)s.%(ext)s"),
+        "ffmpeg_location": "ffmpeg",
         "quiet": True,
         "no_warnings": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "paths": {"home": workdir},
-        "outtmpl": "%(id)s.%(ext)s",
     }
+    try:
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = await loop.run_in_executor(None, ydl.extract_info, url, download=True)
+            return info
+    except Exception:
+        return None
 
-    if mode == "voice":
-        options["format"] = "bestaudio/best"
-    else:
-        options["format"] = "bestvideo+bestaudio/best"
+async def convert_to_ogg(src_file: Path, dst_name: str):
+    out_file = DOWNLOAD_DIR / f"{dst_name}.ogg"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", str(src_file), "-vn", "-c:a", "libopus", "-y", str(out_file),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.wait()
+    src_file.unlink(missing_ok=True)
+    return out_file if out_file.exists() else None
 
-    return options
-
-
-def search_youtube_3(query: str) -> dict:
-    options = {
+async def download_voice(url: str):
+    temp_base = DOWNLOAD_DIR / "audio_tmp"
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(temp_base),
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
     }
+    try:
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = await loop.run_in_executor(None, ydl.extract_info, url, download=True)
+            if not info:
+                return None
+        src_file = temp_base.with_suffix("." + info.get("ext"))
+        safe_name = sanitize_filename(info.get("uploader"), info.get("title"))
+        return await convert_to_ogg(src_file, safe_name)
+    except Exception:
+        for f in DOWNLOAD_DIR.glob("audio_tmp*"):
+            f.unlink(missing_ok=True)
+        return None
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        result = ydl.extract_info(f"ytsearch3:{query}", download=False)
+def parse_duration_str(s: str):
+    s = s.strip().replace(" ", "")
+    try:
+        if ":" not in s:
+            return float(s)
+        if "." in s:
+            h_part, rest = s.split(".", 1)
+            m, sec = rest.split(":")
+            return int(h_part)*3600 + int(m)*60 + float(sec)
+        m, sec = s.split(":")
+        return int(m)*60 + float(sec)
+    except Exception:
+        return None
 
-    entries = [entry for entry in (result.get("entries") or []) if entry]
-
-    entries.sort(
-        key=lambda entry: int(entry.get("view_count") or 0),
-        reverse=True,
+async def trim_audio_file(src: Path, dst: Path, start, end):
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{end-start:.3f}",
+        "-c", "copy", "-y", str(dst), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
     )
+    return await proc.wait() == 0
 
-    if not entries:
-        raise RuntimeError("no youtube results")
+reply_list = [
+    "اهلين وسهلين\nاستاذ/ة",
+    "وياك بوت ميديا دز رابط منشور\nالفيد وادزلكيا",
+    "مو ناوي تستعملني مثل\nالبوتات ترى بس اضوج ينتفخ ديسي",
+    "راح انزع وتنيكني بدال هذا\nالنيج شو داضوج"
+]
+success_default = [
+    "هلو باي\nاه",
+    "باي هلو\nاه",
+    "اه باي\nهلو",
+    "اه هلو\nباي"
+]
 
-    return entries[0]
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    pass
 
-
-def download_with_ytdlp(url: str, mode: str, workdir: str):
-    options = ytdlp_options(workdir, mode)
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-        prepared = Path(ydl.prepare_filename(info))
-        if prepared.exists():
-            return prepared, info
-
-        files = [
-            path for path in Path(workdir).iterdir()
-            if path.is_file()
-        ]
-        if not files:
-            raise RuntimeError("download failed")
-
-        return max(files, key=lambda p: p.stat().st_mtime), info
-
-
-async def convert_to_ogg_opus(source: Path, target: Path):
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-i", str(source),
-        "-vn",
-        "-c:a", "libopus",
-        "-f", "ogg",
-        str(target),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    code = await process.wait()
-
-    if code != 0 or not target.exists():
-        raise RuntimeError("opus conversion failed")
-
-
-async def send_saved_file(
-    bot: Bot,
-    message: Message,
-    mode: str,
-    file_id: str,
-):
-    if mode == "voice":
-        await bot.send_voice(
-            chat_id=message.chat.id,
-            voice=file_id,
-        )
+@dp.message(F.text == "ادت")
+async def settings_panel(message: Message, bot: Bot):
+    chat_id = message.chat.id
+    if chat_id > 0:
+        owner_id = message.chat.id
     else:
-        await bot.send_document(
-            chat_id=message.chat.id,
-            document=file_id,
-        )
+        owner_id = await get_chat_owner_id(bot, chat_id)
+    if not owner_id or message.from_user.id != owner_id:
+        return
+    mode = await get_chat_mode(chat_id)
+    await message.answer("تستطيع تغيير وضع عمل البوت\nمن هنا", reply_markup=get_settings_keyboard(mode))
 
-
-async def process_url(
-    bot: Bot,
-    message: Message,
-    url: str,
-    mode: str,
-):
-    if is_telegram_url(url):
+@dp.callback_query(F.data.startswith("setmode:"))
+async def change_mode_cb(cq: CallbackQuery, bot: Bot):
+    _, target_mode = cq.data.split(":")
+    chat_id = cq.message.chat.id
+    if chat_id > 0:
+        owner_id = chat_id
+    else:
+        owner_id = await get_chat_owner_id(bot, chat_id)
+    if cq.from_user.id != owner_id:
+        await cq.answer("عزيزي\nليس مصرح لك بذلك", show_alert=True)
         return
 
-    scope = scope_for_message(message)
-    source_type = "url"
-    content_id = sha256_id(url)
+    current_mode = await get_chat_mode(chat_id)
 
-    existing = await get_file_record(
-        scope, mode, source_type, content_id
-    )
-    if existing:
-        await send_saved_file(
-            bot, message, mode, existing[0]
-        )
-        return
-
-    status = await message.answer(START_TEXT)
-    workdir = tempfile.mkdtemp(prefix="download_")
-
-    try:
-        path, info = await asyncio.to_thread(
-            download_with_ytdlp,
-            url,
-            mode,
-            workdir,
-        )
-
-        if mode == "voice":
-            output = Path(workdir) / "voice.ogg"
-            await convert_to_ogg_opus(path, output)
-
-            sent = await bot.send_voice(
-                chat_id=message.chat.id,
-                voice=FSInputFile(output),
-            )
-
-            await save_file_record(
-                scope,
-                mode,
-                source_type,
-                content_id,
-                sent.voice.file_id,
-                "voice.ogg",
-            )
-        else:
-            filename = build_filename(info, path)
-
-            sent = await bot.send_document(
-                chat_id=message.chat.id,
-                document=FSInputFile(
-                    path,
-                    filename=filename,
-                ),
-            )
-
-            await save_file_record(
-                scope,
-                mode,
-                source_type,
-                content_id,
-                sent.document.file_id,
-                filename,
-            )
-
-    except Exception:
-        await message.answer(FAIL_TEXT)
-
-    finally:
-        try:
-            await status.delete()
-        except Exception:
-            pass
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-async def process_youtube(
-    bot: Bot,
-    message: Message,
-    query: str,
-    mode: str,
-):
-    scope = scope_for_message(message)
-    status = None
-    workdir = tempfile.mkdtemp(prefix="youtube_")
-
-    try:
-        result = await asyncio.to_thread(
-            search_youtube_3,
-            query,
-        )
-
-        video_id = result.get("id")
-        video_url = result.get("webpage_url") or result.get("url")
-
-        if not video_id or not video_url:
-            raise RuntimeError("youtube result has no URL")
-
-        existing = await get_file_record(
-            scope,
-            mode,
-            "youtube",
-            video_id,
-        )
-
-        if existing:
-            await send_saved_file(
-                bot,
-                message,
-                mode,
-                existing[0],
-            )
+    if target_mode == "default":
+        if current_mode == "default":
+            await cq.answer("زر افتراضي مُفعل\nبالفعل", show_alert=True)
             return
+        await set_chat_mode(chat_id, "default")
+        await cq.message.edit_reply_markup(reply_markup=get_settings_keyboard("default"))
+        await cq.message.answer(random.choice(success_default))
+        await cq.answer()
 
-        status = await message.answer(
-            YT_START_TEXT.format(query=query)
-        )
-
-        path, info = await asyncio.to_thread(
-            download_with_ytdlp,
-            video_url,
-            mode,
-            workdir,
-        )
-
-        if mode == "voice":
-            output = Path(workdir) / f"{video_id}.ogg"
-            await convert_to_ogg_opus(path, output)
-
-            sent = await bot.send_voice(
-                chat_id=message.chat.id,
-                voice=FSInputFile(output),
-            )
-
-            await save_file_record(
-                scope,
-                mode,
-                "youtube",
-                video_id,
-                sent.voice.file_id,
-                output.name,
-            )
+    elif target_mode == "voice":
+        new_mode = "default" if current_mode == "voice" else "voice"
+        await set_chat_mode(chat_id, new_mode)
+        await cq.message.edit_reply_markup(reply_markup=get_settings_keyboard(new_mode))
+        if new_mode == "default":
+            await cq.answer()
         else:
-            filename = build_filename(info, path)
+            await cq.answer()
 
-            sent = await bot.send_document(
-                chat_id=message.chat.id,
-                document=FSInputFile(
-                    path,
-                    filename=filename,
-                ),
-            )
+@dp.message()
+async def router(message: Message, bot: Bot):
+    chat_id = message.chat.id
+    text = message.text.strip() if message.text else ""
+    uid = message.from_user.id if message.from_user else None
+    is_private = chat_id > 0
 
-            await save_file_record(
-                scope,
-                mode,
-                "youtube",
-                video_id,
-                sent.document.file_id,
-                filename,
-            )
-
-    except Exception:
-        await message.answer(YT_FAIL_TEXT)
-
-    finally:
-        if status:
-            try:
-                await status.delete()
-            except Exception:
-                pass
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-async def submit_job(
-    bot: Bot,
-    message: Message,
-    value: str,
-    mode: str,
-    youtube: bool,
-):
-    try:
-        download_queue.put_nowait(
-            (bot, message, value, mode, youtube)
-        )
-    except asyncio.QueueFull:
-        return
-
-
-@router.message(F.text.startswith("يوت "))
-async def youtube_handler(message: Message):
-    query = message.text[4:].strip()
-    if not query:
-        return
-
-    mode = await get_mode(scope_for_message(message))
-    await submit_job(
-        message.bot,
-        message,
-        query,
-        mode,
-        True,
-    )
-
-
-async def rotating_reply(message: Message):
-    if not message.from_user:
-        return
-    key = f"{message.chat.id}:{message.from_user.id}"
-    async with reply_state_lock:
-        index = reply_state.get(key, 0)
-        reply_state[key] = (index + 1) % len(BOT_REPLIES)
-    await message.answer(BOT_REPLIES[index])
-
-
-@router.message(F.text)
-async def text_handler(message: Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
-    url = normalize_url(text)
-    if url:
-        if is_telegram_url(url):
+    if chat_id in trim_sessions and uid == trim_sessions[chat_id].get("uid"):
+        session = trim_sessions[chat_id]
+        parts = text.split("/")
+        if len(parts) != 2:
+            trim_sessions.pop(chat_id, None)
+            await message.reply("تم انهاء وضع تعديل مدة الفويس\nتنسيق غير صالح")
             return
-        mode = await get_mode(scope_for_message(message))
-        await submit_job(message.bot, message, url, mode, False)
+        t1 = parse_duration_str(parts[0])
+        t2 = parse_duration_str(parts[1])
+        if t1 is None or t2 is None or t2 <= t1:
+            trim_sessions.pop(chat_id, None)
+            await message.reply("تم انهاء وضع تعديل مدة الفويس\nتنسيق غير صالح")
+            return
+        if t2 > session["duration"]:
+            await message.reply("مدة هذه الصوتيه اصغر من المدة اللتي\nارسلتها")
+            return
+        out_path = DOWNLOAD_DIR / f"trimmed_{chat_id}.ogg"
+        ok = await trim_audio_file(session["path"], out_path, t1, t2)
+        if ok:
+            await bot.send_voice(chat_id, FSInputFile(out_path))
+        out_path.unlink(missing_ok=True)
+        trim_sessions.pop(chat_id, None)
         return
-    if text.startswith("يوت "):
+
+    if text.lower().startswith("يوت "):
+        query = text[4:].strip()
+        if not query:
+            return
+        res = await search_youtube(query)
+        if not res:
+            await message.reply("الرابط غير مدعوم او اليوتيوب مو راضي يتعاون\nشم طيزي يلا")
+            return
+        vid_url = "https://youtu.be/" + res["id"]
+        disp_title = format_case(res["title"])
+        starter = await message.reply(f"ها تريد {disp_title}\nتمام عبي")
+        if len(active_tasks) >= TOTAL_MAX_TASKS:
+            return
+        asyncio.create_task(process_yut(message, bot, vid_url, starter))
         return
-    if message.chat.type == "private" or text == "بوت":
-        await rotating_reply(message)
 
+    url_match = PATTERN_URL.search(text)
+    if url_match and not PATTERN_TELEGRAM.search(text):
+        url = url_match.group()
+        if len(active_tasks) >= TOTAL_MAX_TASKS:
+            return
+        mode = await get_chat_mode(chat_id)
+        starter = await message.reply("ههع شم كسي\nيلا")
+        asyncio.create_task(process_download(message, bot, url, starter, mode))
+        return
 
-async def worker():
-    while True:
-        bot, message, value, mode, youtube = await download_queue.get()
+    if text == "تعديل" and message.reply_to_message and message.reply_to_message.voice:
+        vid = message.reply_to_message.voice
+        fid = vid.file_id
+        dur = vid.duration
+        trim_sessions[chat_id] = {"uid": uid, "file_id": fid, "duration": dur, "path": DOWNLOAD_DIR}
+        await message.reply("تستطيع تعديل مدة الصوتيات هكذا\n\n12:45 / 18:36 وللساعات 12.30:48")
+        return
 
-        try:
-            if youtube:
-                await process_youtube(
-                    bot,
-                    message,
-                    value,
-                    mode,
-                )
+    should_respond = False
+    if is_private and uid:
+        should_respond = True
+    elif not is_private and text == "بوت" and uid:
+        should_respond = True
+
+    if should_respond and uid:
+        idx = await next_user_index(uid)
+        await message.reply(reply_list[idx])
+
+async def process_download(msg: Message, bot: Bot, url: str, starter: Message, mode: str):
+    chat_id = msg.chat.id
+    active_tasks.add(chat_id)
+    try:
+        async with semaphore:
+            fid = url
+            if fid in file_id_cache.get(mode, set()):
+                await starter.delete()
+                return
+            if mode == "voice":
+                out_file = await download_voice(url)
+                if out_file:
+                    await bot.send_voice(chat_id, FSInputFile(out_file))
+                    file_id_cache[mode].add(fid)
+                    out_file.unlink(missing_ok=True)
             else:
-                await process_url(
-                    bot,
-                    message,
-                    value,
-                    mode,
-                )
-        finally:
-            download_queue.task_done()
+                info = await download_default(url)
+                if info:
+                    fn = sanitize_filename(info.get("uploader"), info.get("title")) + "." + info.get("ext")
+                    fp = DOWNLOAD_DIR / fn
+                    if fp.exists():
+                        await bot.send_document(chat_id, FSInputFile(fp))
+                        file_id_cache[mode].add(fid)
+                        fp.unlink(missing_ok=True)
+            success = bool(out_file) or bool(info)
+            if not success:
+                await starter.edit_text("الرابط غير مدعوم او الموقع مو راضي يتعاون\nشم طيزي يلا")
+                return
+            await starter.delete()
+    finally:
+        active_tasks.discard(chat_id)
 
+async def process_yut(msg: Message, bot: Bot, url: str, starter: Message):
+    chat_id = msg.chat.id
+    task_key = f"yut_{chat_id}"
+    active_tasks.add(task_key)
+    try:
+        async with semaphore:
+            fid = url
+            if fid in file_id_cache.get("yut", set()):
+                await starter.delete()
+                return
+            out_file = await download_voice(url)
+            if not out_file:
+                await starter.edit_text("الرابط غير مدعوم او اليوتيوب مو راضي يتعاون\nشم طيزي يلا")
+                return
+            await bot.send_voice(chat_id, FSInputFile(out_file))
+            file_id_cache["yut"].add(fid)
+            out_file.unlink(missing_ok=True)
+            await starter.delete()
+    finally:
+        active_tasks.discard(task_key)
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-
     await init_db()
-
-    bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    workers = [
-        asyncio.create_task(worker())
-        for _ in range(ACTIVE_DOWNLOADS)
-    ]
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        for task in workers:
-            task.cancel()
-
-        await asyncio.gather(
-            *workers,
-            return_exceptions=True,
-        )
-
-        await bot.session.close()
-
+    bot = Bot(token=BOT_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
