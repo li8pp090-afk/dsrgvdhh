@@ -23,7 +23,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -156,6 +156,7 @@ def is_telegram_url(text):
 
 def extract_url(text):
     match = re.search(r"https?://\S+", text or "")
+
     if not match:
         return None
 
@@ -225,20 +226,13 @@ def parse_range(text):
     return start, end
 
 
-def duration_of(path):
-    process = awaitable_subprocess(
+async def duration_of(path):
+    process = await asyncio.create_subprocess_exec(
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path)
-    )
-    return process
-
-
-async def awaitable_subprocess(*args):
-    process = await asyncio.create_subprocess_exec(
-        *args,
+        str(path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL
     )
@@ -306,7 +300,6 @@ async def download_default(url, folder):
     options = {
         "format": "bestvideo+bestaudio/best",
         "outtmpl": str(folder / "%(title)s.%(ext)s"),
-        "merge_output_format": None,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True
@@ -498,7 +491,9 @@ async def process_youtube(message, url):
         )
         return
 
-    if not await acquire_slot(user_key(message)):
+    slot = await acquire_slot(user_key(message))
+
+    if not slot:
         return
 
     folder = Path(tempfile.mkdtemp(dir=DOWNLOAD_ROOT))
@@ -555,7 +550,9 @@ async def process_url(message, url):
             )
         return
 
-    if not await acquire_slot(user_key(message)):
+    slot = await acquire_slot(user_key(message))
+
+    if not slot:
         return
 
     start = await message.answer(
@@ -710,7 +707,9 @@ async def direct_media(message: Message):
         )
         return
 
-    if not await acquire_slot(user_key(message)):
+    slot = await acquire_slot(user_key(message))
+
+    if not slot:
         return
 
     folder = Path(tempfile.mkdtemp(dir=DOWNLOAD_ROOT))
@@ -777,7 +776,9 @@ async def edit_duration(message: Message):
         )
         return
 
-    if not await acquire_slot(key):
+    slot = await acquire_slot(key)
+
+    if not slot:
         return
 
     folder = Path(tempfile.mkdtemp(dir=DOWNLOAD_ROOT))
@@ -863,7 +864,11 @@ async def text_handler(message: Message):
 
 async def main():
     bot = Bot(TOKEN)
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
