@@ -3,3 +3,4 @@ yt-dlp
 aiohttp
 aiodns
 aiosqlite
+youtube-search-python
