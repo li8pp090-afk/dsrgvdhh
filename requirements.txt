@@ -1,6 +1,5 @@
 aiogram
 yt-dlp
-youtube-search-python
 aiohttp
 aiodns
 aiosqlite
