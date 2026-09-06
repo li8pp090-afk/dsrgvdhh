@@ -149,16 +149,16 @@ async def set_mode(scope: str, mode: str):
         await db.commit()
 
 
-async def get_file_record(scope, mode, source_type, content_id):
+async def get_file_record(mode, source_type, content_id):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
             SELECT file_id, filename
             FROM id_files
-            WHERE scope_key = ?
-              AND mode = ?
+            WHERE mode = ?
               AND source_type = ?
               AND content_id = ?
-        """, (scope, mode, source_type, content_id))
+            LIMIT 1
+        """, (mode, source_type, content_id))
         return await cur.fetchone()
 
 
@@ -277,6 +277,11 @@ def ytdlp_options(workdir: str, mode: str) -> dict:
         "noplaylist": True,
         "paths": {"home": workdir},
         "outtmpl": "%(id)s.%(ext)s",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"]
+            }
+        },
     }
 
     if mode == "voice":
@@ -384,7 +389,7 @@ async def process_url(
     content_id = sha256_id(url)
 
     existing = await get_file_record(
-        scope, mode, source_type, content_id
+        mode, source_type, content_id
     )
     if existing:
         await send_saved_file(
@@ -453,7 +458,8 @@ async def process_url(
 
     finally:
         try:
-            await status.delete()
+            if status:
+                await status.delete()
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
@@ -482,7 +488,6 @@ async def process_youtube(
             raise RuntimeError("youtube result has no URL")
 
         existing = await get_file_record(
-            scope,
             mode,
             "youtube",
             video_id,
