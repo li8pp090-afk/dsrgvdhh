@@ -1,5 +1,3 @@
 aiogram
 yt-dlp
-aiohttp
-aiodns
 yt-search-python
