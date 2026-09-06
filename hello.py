@@ -9,9 +9,9 @@ from urllib.parse import urlparse
 
 import aiosqlite
 import yt_dlp
-from youtubesearchpython import VideosSearch
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from youtubesearchpython.__future__ import VideosSearch
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "bot.sqlite3")
@@ -292,31 +292,6 @@ def ytdlp_options(workdir: str, mode: str) -> dict:
     return options
 
 
-def search_youtube_3(query: str) -> dict:
-    search = VideosSearch(query, limit=3)
-    results = search.result().get("result", [])
-
-    if not results:
-        raise RuntimeError("no youtube results")
-
-    def parse_views(entry):
-        views_text = entry.get("viewCount", {}).get("short", "0")
-        clean = re.sub(r"[^\d]", "", views_text)
-        return int(clean) if clean else 0
-
-    results.sort(
-        key=parse_views,
-        reverse=True,
-    )
-
-    top = results[0]
-    return {
-        "id": top.get("id"),
-        "webpage_url": top.get("link"),
-        "title": top.get("title"),
-    }
-
-
 def download_with_ytdlp(url: str, mode: str, workdir: str):
     options = ytdlp_options(workdir, mode)
 
@@ -476,16 +451,15 @@ async def process_youtube(
     workdir = tempfile.mkdtemp(prefix="youtube_")
 
     try:
-        result = await asyncio.to_thread(
-            search_youtube_3,
-            query,
-        )
+        search = VideosSearch(query, limit=1)
+        res = await search.next()
 
-        video_id = result.get("id")
-        video_url = result.get("webpage_url") or result.get("url")
+        results = res.get("result", [])
+        if not results:
+            raise RuntimeError("no results")
 
-        if not video_id or not video_url:
-            raise RuntimeError("youtube result has no URL")
+        video_id = results[0]["id"]
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
 
         existing = await get_file_record(
             mode,
