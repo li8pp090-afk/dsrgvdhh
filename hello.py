@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import aiosqlite
 import yt_dlp
+from youtubesearchpython import VideosSearch
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
@@ -182,7 +183,7 @@ async def is_chat_owner(message: Message) -> bool:
         member = await message.bot.get_chat_member(
             message.chat.id, message.from_user.id
         )
-        return member.status == "creator"
+        return member.status in ("creator", "administrator")
     except Exception:
         return False
 
@@ -198,7 +199,7 @@ async def is_callback_owner(callback: CallbackQuery) -> bool:
         member = await callback.bot.get_chat_member(
             callback.message.chat.id, callback.from_user.id
         )
-        return member.status == "creator"
+        return member.status in ("creator", "administrator")
     except Exception:
         return False
 
@@ -206,7 +207,7 @@ async def is_callback_owner(callback: CallbackQuery) -> bool:
 def settings_markup(mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text="صوت",
+            text="فويس",
             callback_data="mode:voice",
             style="primary" if mode == "voice" else "danger",
         ),
@@ -229,6 +230,7 @@ async def edit_mode(message: Message):
     await message.answer(
         "تستطيع تغيير وضع عمل البوت\nمن هنا",
         reply_markup=settings_markup(mode),
+        reply_to_message_id=message.message_id,
     )
 
 
@@ -286,27 +288,28 @@ def ytdlp_options(workdir: str, mode: str) -> dict:
 
 
 def search_youtube_3(query: str) -> dict:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
-    }
+    search = VideosSearch(query, limit=3)
+    results = search.result().get("result", [])
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        result = ydl.extract_info(f"ytsearch3:{query}", download=False)
+    if not results:
+        raise RuntimeError("no youtube results")
 
-    entries = [entry for entry in (result.get("entries") or []) if entry]
+    def parse_views(entry):
+        views_text = entry.get("viewCount", {}).get("short", "0")
+        clean = re.sub(r"[^\d]", "", views_text)
+        return int(clean) if clean else 0
 
-    entries.sort(
-        key=lambda entry: int(entry.get("view_count") or 0),
+    results.sort(
+        key=parse_views,
         reverse=True,
     )
 
-    if not entries:
-        raise RuntimeError("no youtube results")
-
-    return entries[0]
+    top = results[0]
+    return {
+        "id": top.get("id"),
+        "webpage_url": top.get("link"),
+        "title": top.get("title"),
+    }
 
 
 def download_with_ytdlp(url: str, mode: str, workdir: str):
@@ -357,11 +360,13 @@ async def send_saved_file(
         await bot.send_voice(
             chat_id=message.chat.id,
             voice=file_id,
+            reply_to_message_id=message.message_id,
         )
     else:
         await bot.send_document(
             chat_id=message.chat.id,
             document=file_id,
+            reply_to_message_id=message.message_id,
         )
 
 
@@ -387,7 +392,10 @@ async def process_url(
         )
         return
 
-    status = await message.answer(START_TEXT)
+    status = await message.answer(
+        START_TEXT,
+        reply_to_message_id=message.message_id,
+    )
     workdir = tempfile.mkdtemp(prefix="download_")
 
     try:
@@ -405,6 +413,7 @@ async def process_url(
             sent = await bot.send_voice(
                 chat_id=message.chat.id,
                 voice=FSInputFile(output),
+                reply_to_message_id=message.message_id,
             )
 
             await save_file_record(
@@ -424,6 +433,7 @@ async def process_url(
                     path,
                     filename=filename,
                 ),
+                reply_to_message_id=message.message_id,
             )
 
             await save_file_record(
@@ -436,7 +446,10 @@ async def process_url(
             )
 
     except Exception:
-        await message.answer(FAIL_TEXT)
+        await message.answer(
+            FAIL_TEXT,
+            reply_to_message_id=message.message_id,
+        )
 
     finally:
         try:
@@ -485,7 +498,8 @@ async def process_youtube(
             return
 
         status = await message.answer(
-            YT_START_TEXT.format(query=query)
+            YT_START_TEXT.format(query=query),
+            reply_to_message_id=message.message_id,
         )
 
         path, info = await asyncio.to_thread(
@@ -502,6 +516,7 @@ async def process_youtube(
             sent = await bot.send_voice(
                 chat_id=message.chat.id,
                 voice=FSInputFile(output),
+                reply_to_message_id=message.message_id,
             )
 
             await save_file_record(
@@ -521,6 +536,7 @@ async def process_youtube(
                     path,
                     filename=filename,
                 ),
+                reply_to_message_id=message.message_id,
             )
 
             await save_file_record(
@@ -533,7 +549,10 @@ async def process_youtube(
             )
 
     except Exception:
-        await message.answer(YT_FAIL_TEXT)
+        await message.answer(
+            YT_FAIL_TEXT,
+            reply_to_message_id=message.message_id,
+        )
 
     finally:
         if status:
@@ -582,7 +601,10 @@ async def rotating_reply(message: Message):
     async with reply_state_lock:
         index = reply_state.get(key, 0)
         reply_state[key] = (index + 1) % len(BOT_REPLIES)
-    await message.answer(BOT_REPLIES[index])
+    await message.answer(
+        BOT_REPLIES[index],
+        reply_to_message_id=message.message_id,
+    )
 
 
 @router.message(F.text)
