@@ -1,5 +1,4 @@
 import asyncio
-import tempfile
 
 from aiogram import F, Router
 from aiogram.enums import ChatType
@@ -89,7 +88,7 @@ def release_download_slot():
     DOWNLOAD_SEMAPHORE.release()
 
 
-@router.message()
+@router.message(F.text != "ادت")
 async def main_handler(
     message: Message,
 ):
