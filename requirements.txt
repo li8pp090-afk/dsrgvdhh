@@ -1,4 +1,2 @@
 aiogram
-aiosqlite
 yt-dlp
-youtube-search-python
