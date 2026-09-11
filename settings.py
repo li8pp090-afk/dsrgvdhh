@@ -44,28 +44,56 @@ def mode_keyboard(mode):
     )
 
 
+def is_admin_chat(chat_type):
+    return chat_type in {
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    }
+
+
+async def is_admin(
+    message,
+    user_id,
+):
+    member = await message.bot.get_chat_member(
+        message.chat.id,
+        user_id,
+    )
+
+    return member.status in {
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.CREATOR,
+    }
+
+
 @router.message(F.text == "ادت")
 async def settings_handler(
     message: Message,
 ):
-    if message.chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
+    if message.chat.type == ChatType.PRIVATE:
+        current_mode = get_mode(
+            chat_key(message)
+        )
+
+        await message.answer(
+            "تستطيع تغيير وضع عمل البوت\nمن هنا",
+            reply_markup=mode_keyboard(
+                current_mode
+            ),
+            reply_parameters=message.as_reply_parameters(),
+        )
+        return
+
+    if not is_admin_chat(message.chat.type):
         return
 
     if not message.from_user:
         return
 
-    member = await message.bot.get_chat_member(
-        message.chat.id,
+    if not await is_admin(
+        message,
         message.from_user.id,
-    )
-
-    if member.status not in {
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    }:
+    ):
         return
 
     current_mode = get_mode(
@@ -91,30 +119,28 @@ async def mode_callback(
         await callback.answer()
         return
 
-    if callback.message.chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        await callback.answer(
-            "عزيزي\nليس مصرح لك بذلك",
-            show_alert=True,
-        )
-        return
+    if (
+        callback.message.chat.type
+        != ChatType.PRIVATE
+    ):
+        if not is_admin_chat(
+            callback.message.chat.type
+        ):
+            await callback.answer(
+                "عزيزي\nليس مصرح لك بذلك",
+                show_alert=True,
+            )
+            return
 
-    member = await callback.bot.get_chat_member(
-        callback.message.chat.id,
-        callback.from_user.id,
-    )
-
-    if member.status not in {
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    }:
-        await callback.answer(
-            "عزيزي\nليس مصرح لك بذلك",
-            show_alert=True,
-        )
-        return
+        if not await is_admin(
+            callback.message,
+            callback.from_user.id,
+        ):
+            await callback.answer(
+                "عزيزي\nليس مصرح لك بذلك",
+                show_alert=True,
+            )
+            return
 
     key = chat_key(
         callback.message
