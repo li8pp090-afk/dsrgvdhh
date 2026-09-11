@@ -2,7 +2,10 @@ import asyncio
 
 from aiogram import Bot, Dispatcher
 
-from config import TOKEN
+from config import (
+    TOKEN,
+    BOOT_MESSAGE_IDS,
+)
 from database import database
 from handlers import router
 
@@ -18,6 +21,15 @@ async def main():
     bot = Bot(
         token=TOKEN,
     )
+
+    for user_id in BOOT_MESSAGE_IDS:
+        try:
+            await bot.send_message(
+                user_id,
+                "اشتغل البوت مرتلخ مولاي\nمواح",
+            )
+        except Exception:
+            pass
 
     dispatcher = Dispatcher()
 
