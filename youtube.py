@@ -9,6 +9,7 @@ def youtube_search(query):
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
+        "noplaylist": True,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -28,11 +29,30 @@ def select_youtube_result(query, results):
         key=lambda item: SequenceMatcher(
             None,
             normalized_query,
-            (
-                item.get("title") or ""
-            ).casefold().strip(),
+            (item.get("title") or "").casefold().strip(),
         ).ratio(),
     )
+
+
+def get_youtube_url(result):
+    webpage_url = result.get("webpage_url")
+
+    if webpage_url and webpage_url.startswith(
+        "http"
+    ):
+        return webpage_url
+
+    video_id = result.get("id")
+
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    url = result.get("url")
+
+    if url and url.startswith("http"):
+        return url
+
+    return None
 
 
 async def resolve_youtube_query(query):
@@ -51,9 +71,8 @@ async def resolve_youtube_query(query):
         results,
     )
 
-    url = (
-        selected.get("webpage_url")
-        or selected.get("url")
+    url = get_youtube_url(
+        selected
     )
 
     if not url:
