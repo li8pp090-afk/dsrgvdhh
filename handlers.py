@@ -33,8 +33,14 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(
     DOWNLOAD_LIMIT
 )
 
-waiting_downloads = 0
-waiting_lock = asyncio.Lock()
+SLOT_QUEUE = asyncio.Queue(
+    maxsize=DOWNLOAD_LIMIT + WAITING_LIMIT
+)
+
+for _ in range(
+    DOWNLOAD_LIMIT + WAITING_LIMIT
+):
+    SLOT_QUEUE.put_nowait(None)
 
 reply_rotation = {}
 reply_rotation_lock = asyncio.Lock()
@@ -63,29 +69,67 @@ async def get_next_rotation(
         return ROTATION_MESSAGES[index]
 
 
-async def acquire_download_slot():
-    global waiting_downloads
-
-    async with waiting_lock:
-        if DOWNLOAD_SEMAPHORE._value > 0:
-            await DOWNLOAD_SEMAPHORE.acquire()
-            return True
-
-        if waiting_downloads >= WAITING_LIMIT:
-            return False
-
-        waiting_downloads += 1
-
-    await DOWNLOAD_SEMAPHORE.acquire()
-
-    async with waiting_lock:
-        waiting_downloads -= 1
-
-    return True
+def acquire_slot():
+    try:
+        SLOT_QUEUE.get_nowait()
+        return True
+    except asyncio.QueueEmpty:
+        return False
 
 
-def release_download_slot():
-    DOWNLOAD_SEMAPHORE.release()
+def release_slot():
+    SLOT_QUEUE.put_nowait(None)
+
+
+async def process_download(
+    message,
+    process_function,
+    source,
+    route,
+    start_text,
+    failure_text,
+):
+    acquired = acquire_slot()
+
+    if not acquired:
+        return
+
+    start_message = None
+
+    try:
+        await DOWNLOAD_SEMAPHORE.acquire()
+
+        start_message = await message.answer(
+            start_text,
+            reply_parameters=message.as_reply_parameters(),
+        )
+
+        await process_function(
+            message,
+            source,
+            route,
+        )
+
+        try:
+            await start_message.delete()
+        except Exception:
+            pass
+
+    except Exception:
+        if start_message:
+            try:
+                await start_message.delete()
+            except Exception:
+                pass
+
+        await message.answer(
+            failure_text,
+            reply_parameters=message.as_reply_parameters(),
+        )
+
+    finally:
+        DOWNLOAD_SEMAPHORE.release()
+        release_slot()
 
 
 @router.message(F.text != "ادت")
@@ -111,9 +155,7 @@ async def main_handler(
             )
             return
 
-        acquired = (
-            await acquire_download_slot()
-        )
+        acquired = acquire_slot()
 
         if not acquired:
             return
@@ -121,33 +163,22 @@ async def main_handler(
         start_message = None
 
         try:
+            await DOWNLOAD_SEMAPHORE.acquire()
+
             start_message = await message.answer(
                 f"ها تريد {query}\nتمام عبي",
                 reply_parameters=message.as_reply_parameters(),
             )
 
-            youtube_url = (
-                await resolve_youtube_query(
-                    query
-                )
+            youtube_url = await resolve_youtube_query(
+                query
             )
 
-            mode = get_mode(
-                chat_key(message)
+            await process_voice(
+                message,
+                youtube_url,
+                "youtube",
             )
-
-            if mode == "voice":
-                await process_voice(
-                    message,
-                    youtube_url,
-                    "youtube",
-                )
-            else:
-                await process_default(
-                    message,
-                    youtube_url,
-                    "youtube",
-                )
 
             try:
                 await start_message.delete()
@@ -167,7 +198,8 @@ async def main_handler(
             )
 
         finally:
-            release_download_slot()
+            DOWNLOAD_SEMAPHORE.release()
+            release_slot()
 
         return
 
@@ -175,57 +207,28 @@ async def main_handler(
         is_url(text)
         and not is_telegram_url(text)
     ):
-        acquired = (
-            await acquire_download_slot()
+        mode = get_mode(
+            chat_key(message)
         )
 
-        if not acquired:
-            return
-
-        start_message = None
-
-        try:
-            start_message = await message.answer(
+        if mode == "voice":
+            await process_download(
+                message,
+                process_voice,
+                text,
+                "url",
                 "ههع شم كسي\nيلا",
-                reply_parameters=message.as_reply_parameters(),
-            )
-
-            mode = get_mode(
-                chat_key(message)
-            )
-
-            if mode == "voice":
-                await process_voice(
-                    message,
-                    text,
-                    "url",
-                )
-            else:
-                await process_default(
-                    message,
-                    text,
-                    "url",
-                )
-
-            try:
-                await start_message.delete()
-            except Exception:
-                pass
-
-        except Exception:
-            if start_message:
-                try:
-                    await start_message.delete()
-                except Exception:
-                    pass
-
-            await message.answer(
                 "الرابط غير مدعوم او الموقع مو راضي يتعاون\nشم طيزي يلا",
-                reply_parameters=message.as_reply_parameters(),
             )
-
-        finally:
-            release_download_slot()
+        else:
+            await process_download(
+                message,
+                process_default,
+                text,
+                "url",
+                "ههع شم كسي\nيلا",
+                "الرابط غير مدعوم او الموقع مو راضي يتعاون\nشم طيزي يلا",
+            )
 
         return
 
